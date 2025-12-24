@@ -1,0 +1,10 @@
+# 忽略PyCharm配置
+.idea/
+*.iml
+
+# 忽略Python临时文件
+__pycache__/
+*.pyc
+
+# 忽略虚拟环境（如果有的话）
+venv/
