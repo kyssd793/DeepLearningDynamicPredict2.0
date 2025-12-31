@@ -105,21 +105,26 @@ def train_lstm_attention_model(preprocessed_df, seq_length=32, save_path='./',
         return model
 
     # 5. 模型路径
-    model_filename = 'lstm_attention_piezo_model.h5'
+    # 5. 模型路径（修改：保存权重而非完整模型）
+    model_weights_path = os.path.join(save_path, 'lstm_model_weights.h5')  # 权重文件
     scaler_filename = 'scaler_piezo.pkl'
-    model_path = os.path.join(save_path, model_filename)
     scaler_path = os.path.join(save_path, scaler_filename)
 
     # 6. 加载/初始化模型
-    if os.path.exists(model_path):
-        print(f"加载已有模型：{model_path}")
-        model = load_model(
-            model_path,
-            custom_objects={'ensemble_loss': ensemble_loss, 'Attention': Attention}
-        )
+    model = build_model()  # 先重建模型结构
+    # 新增：如果权重文件存在，直接加载，不训练
+    if os.path.exists(model_weights_path):
+        print(f"✅ 发现已有权重文件，直接加载：{model_weights_path}")
+        model.load_weights(model_weights_path)
+        # 同时加载scaler
+        if os.path.exists(scaler_path):
+            with open(scaler_path, 'rb') as f:
+                scaler = pickle.load(f)
+        print(f"✅ 跳过训练，直接使用已有模型")
+        return model, scaler
+    # 否则，开始训练
     else:
         print("初始化新模型，开始滚动训练...")
-        model = build_model()
 
     # 7. 滚动验证训练（核心逻辑）
     start_idx = 0
@@ -163,9 +168,9 @@ def train_lstm_attention_model(preprocessed_df, seq_length=32, save_path='./',
         start_idx += roll_step
 
     # 8. 保存最终模型和scaler
-    if not os.path.exists(model_path):
-        model.save(model_path)
-        print(f"\n滚动训练完成，模型保存至：{model_path}")
+    if not os.path.exists(model_weights_path):
+        model.save_weights(model_weights_path)  # 保存权重
+        print(f"\n滚动训练完成，模型权重保存至：{model_weights_path}")
     print(f"平均验证损失：{np.mean(val_loss_list):.4f}")
 
     with open(scaler_path, 'wb') as f:
@@ -175,30 +180,45 @@ def train_lstm_attention_model(preprocessed_df, seq_length=32, save_path='./',
     return model, scaler
 
 
-def predict_with_sliding_window_fixed(dataB, seq_length=32, model_path='./lstm_attention_model_full_dataA.h5',
-                                      scaler_path='./scaler.pkl', future_steps=16, target_total_points=None):
+def predict_with_sliding_window_fixed(dataB, seq_length=32, model_weights_path='./lstm_model_weights.h5',
+                                      scaler_path='./scaler_piezo.pkl', future_steps=16, target_total_points=None):
     """
-    修正后的预测逻辑：对齐代码1，分段预测+真实数据重置窗口（动态适配长度）
-    :param dataB: 输入数据（DataFrame，含CH1V/Voltage列 + Time(s)列）
+    修正后的预测逻辑：对齐代码1，分段预测+真实数据重置窗口（适配无Time(s)列，用采样点序号作为时间）
+    :param dataB: 输入数据（DataFrame，仅含Voltage列）
     :param seq_length: 时间步长（窗口大小）
-    :param model_path: 模型路径
-    :param scaler_path: 标准化器路径
-    :param future_steps: 单次预测长度（每段预测的点数，保持你的16不变）
+    :param model_path: 模型路径（适配咱们的模型命名）
+    :param scaler_path: 标准化器路径（适配咱们的scaler命名）
+    :param future_steps: 单次预测长度（每段预测的点数，保持16不变）
     :param target_total_points: 目标总预测点数（可选，默认预测到数据B的最大长度）
-    :return: 预测时间序列、逆标准化后的预测电压值
+    :return: 预测采样点序号（替代时间）、逆标准化后的预测电压值
     """
     import pickle
     with open(scaler_path, 'rb') as f:
         scaler = pickle.load(f)
 
-    # 适配列名：兼容CH1V（你的旧数据）和Voltage（咱们的新数据）
-    col_name = 'CH1V' if 'CH1V' in dataB.columns else 'Voltage'
+    # 2. 重建模型结构 + 加载权重（核心）
+    def build_model():  # 复制训练时的模型结构
+        inputs = Input(shape=(seq_length, 1))
+        conv1 = Conv1D(filters=64, kernel_size=3, activation='relu')(inputs)
+        conv2 = Conv1D(filters=128, kernel_size=3, activation='relu')(conv1)
+        pool1 = MaxPooling1D(pool_size=2)(conv2)
+        lstm1 = LSTM(units=50, return_sequences=True)(pool1)
+        attention_out = Attention()([lstm1, lstm1])
+        lstm2 = LSTM(units=50, return_sequences=False)(attention_out)
+        lstm2 = Dropout(0.1)(lstm2)
+        outputs = Dense(1)(lstm2)
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer='adam', loss=ensemble_loss)
+        return model
 
-    # 移除清洗（完全保留你的逻辑）
-    # dataB = dataB[(dataB[col_name] > dataB[col_name].quantile(0.01)) &
-    #               (dataB[col_name] < dataB[col_name].quantile(0.99))]
+    model = build_model()
+    model.load_weights(model_weights_path)  # 加载权重
+    print(f"✅ 成功加载模型权重：{model_weights_path}")
 
-    # 标准化（适配动态列名）
+    # 适配列名：仅保留Voltage（咱们的数据列）
+    col_name = 'Voltage' if 'Voltage' in dataB.columns else 'CH1V'
+
+    # 标准化
     dataB_scaled = scaler.transform(dataB[[col_name]])
 
     # 构建测试集窗口（完全保留你的逻辑）
@@ -207,60 +227,154 @@ def predict_with_sliding_window_fixed(dataB, seq_length=32, model_path='./lstm_a
         X_test.append(dataB_scaled[i:i + seq_length, 0])
     X_test = np.array(X_test).reshape(-1, seq_length, 1)
 
-    # ========== 核心优化：动态计算总段数 ==========
-    # 1. 计算X_test能支持的最大段数（避免索引越界）
-    max_possible_steps = len(X_test)  # 每段至少用1个X_test样本初始化窗口
-    # 2. 若指定了目标总点数，计算需要的段数；否则用最大可能段数
+    # 动态计算总段数（保留你的核心优化）
+    max_possible_steps = len(X_test)
     if target_total_points is not None:
-        # 向上取整：确保总点数≥目标值（如目标1000，16/段 → 63段=1008点）
         total_steps = int(np.ceil(target_total_points / future_steps))
     else:
-        # 无目标时，预测到X_test的最大长度（每段用1个初始化样本）
         total_steps = max_possible_steps
-
-    # 安全校验：段数不能超过X_test的最大支持数
     total_steps = min(total_steps, max_possible_steps)
     if total_steps == 0:
         raise ValueError(f"数据B长度不足！X_test仅{len(X_test)}个样本，无法完成至少1段预测")
 
-    # 加载模型（完全保留你的逻辑）
+    # 加载模型
     model = tf.keras.models.load_model(model_path, custom_objects={'ensemble_loss': ensemble_loss})
 
     all_predicted_data = []
-    time_list = []
+    time_list = []  # 现在存储的是采样点序号，替代Time(s)
     for step in range(total_steps):
-        # 1. 用数据B的真实数据初始化窗口（核心逻辑完全保留）
-        start_index = step * future_steps  # 按段数步进，和你原逻辑一致
+        start_index = step * future_steps
         if start_index >= len(X_test):
             break
         last_sequence = X_test[start_index].reshape(1, seq_length, 1)
 
-        # 2. 单次预测future_steps个点（完全保留你的滚动窗口逻辑）
+        # 单次预测future_steps个点（完全保留你的逻辑）
         predicted_data = []
         for i in range(future_steps):
             predicted_value = model.predict(last_sequence, verbose=0)
             predicted_data.append(predicted_value[0, 0])
-            # 滚动窗口（仅在当前段内）
             last_sequence = np.roll(last_sequence, -1, axis=1)
             last_sequence[0, -1, 0] = predicted_value[0, 0]
 
-        # 3. 收集预测结果和时间（完全保留你的时间计算逻辑）
+        # ========== 核心适配：用采样点序号替代Time(s) ==========
         all_predicted_data.extend(predicted_data)
-        # 生成对应时间（适配动态列名）
-        start_time = dataB['Time(s)'].iloc[start_index + seq_length]
-        time_interval = dataB['Time(s)'].iloc[1] - dataB['Time(s)'].iloc[0]
-        time_list.extend([start_time + i * time_interval for i in range(len(predicted_data))])
+        # 起始采样点：start_index + seq_length（和你原逻辑对齐）
+        start_point = start_index + seq_length
+        # 生成采样点序号（替代时间轴）：[start_point, start_point+1, ..., start_point+future_steps-1]
+        time_list.extend([start_point + i for i in range(len(predicted_data))])
 
-    # 逆标准化（完全保留）
+    # 逆标准化
     all_predicted_data = np.array(all_predicted_data).reshape(-1, 1)
     all_predicted_data_inversed = scaler.inverse_transform(all_predicted_data)
-    time_data = np.array(time_list)
+    time_data = np.array(time_list)  # 现在是采样点序号，不是时间
 
-    # 输出预测信息（方便调试）
     print(f"✅ 预测完成：共分{total_steps}段，单次预测{future_steps}点，总预测{len(all_predicted_data)}点")
     return time_data, all_predicted_data_inversed
 
 
+# 以固定窗口，32-》生成32-64的生成值，32-64真实值生成64-96的生成值，以此类推
+def predict_stepped_window_fast(dataB, seq_length=32, model_weights_path='./lstm_model_weights.h5',
+                                scaler_path='./scaler_piezo.pkl', predict_step=32, target_total_points=None):
+    """
+    步进式窗口预测（按你的思路优化：牺牲少量连滚精度，换取极致速度）
+    :param dataB: 输入数据（DataFrame，仅含Voltage列）
+    :param seq_length: 输入窗口长度（固定32）
+    :param model_path: 模型路径
+    :param scaler_path: 标准化器路径
+    :param predict_step: 单次预测点数（和输入窗口等长，固定32）
+    :param target_total_points: 目标总预测点数（默认20万）
+    :return: 预测采样点序号、逆标准化后的预测电压值
+    """
+    import pickle
+    import numpy as np
+    from tensorflow.keras.models import load_model
+
+    # 1. 加载scaler和模型
+    with open(scaler_path, 'rb') as f:
+        scaler = pickle.load(f)
+
+    # 2. 重建模型结构 + 加载权重
+    def build_model():  # 复制训练时的模型结构
+        inputs = Input(shape=(seq_length, 1))
+        conv1 = Conv1D(filters=64, kernel_size=3, activation='relu')(inputs)
+        conv2 = Conv1D(filters=128, kernel_size=3, activation='relu')(conv1)
+        pool1 = MaxPooling1D(pool_size=2)(conv2)
+        lstm1 = LSTM(units=50, return_sequences=True)(pool1)
+        attention_out = Attention()([lstm1, lstm1])
+        lstm2 = LSTM(units=50, return_sequences=False)(attention_out)
+        lstm2 = Dropout(0.1)(lstm2)
+        outputs = Dense(1)(lstm2)
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer='adam', loss=ensemble_loss)
+        return model
+
+    model = build_model()
+    model.load_weights(model_weights_path)
+    print(f"✅ 成功加载模型权重：{model_weights_path}")
+
+    # 2. 适配列名+标准化
+    col_name = 'Voltage' if 'Voltage' in dataB.columns else 'CH1V'
+    data_scaled = scaler.transform(dataB[[col_name]])
+    data_length = len(data_scaled)
+
+    # 3. 确定目标预测量（默认20万）
+    if target_total_points is None:
+        target_total_points = data_length
+    # 确保预测点数是predict_step的整数倍
+    target_total_points = ((target_total_points + predict_step - 1) // predict_step) * predict_step
+
+    # 4. 初始化变量
+    all_pred_time = []  # 预测点序号
+    all_pred_data = []  # 预测值（标准化）
+    current_start = 0  # 当前真实数据起始位置
+
+    # 5. 核心：步进式预测（每轮用32真实数据→预测32点→步进32）
+    while len(all_pred_data) < target_total_points:
+        # 边界校验：确保真实数据足够取32个
+        if current_start + seq_length > data_length:
+            break
+
+        # 取当前轮的真实数据窗口（核心：用真实数据重置，避免误差累积）
+        current_window = data_scaled[current_start:current_start + seq_length, 0]
+        current_window = current_window.reshape(1, seq_length, 1)  # 模型输入格式
+
+        # 单次预测32个点（替代原来的逐点预测）
+        predicted_data = []
+        temp_window = current_window.copy()
+        for i in range(predict_step):
+            # 预测1个点
+            pred = model.predict(temp_window, verbose=0)[0, 0]
+            predicted_data.append(pred)
+            # 窗口滚动（用预测值填充，仅本轮内滚动）
+            temp_window = np.roll(temp_window, -1, axis=1)
+            temp_window[0, -1, 0] = pred
+
+        # 计算当前轮预测点的序号
+        pred_start = current_start + seq_length  # 预测点从真实窗口后开始
+        pred_time = [pred_start + i for i in range(predict_step)]
+
+        # 累加结果
+        all_pred_data.extend(predicted_data)
+        all_pred_time.extend(pred_time)
+
+        # 步进：下一轮取新的32个真实数据（核心：用真实数据重置）
+        current_start += predict_step
+
+        # 打印进度（方便监控）
+        progress = min(len(all_pred_data) / target_total_points * 100, 100)
+        print(f"预测进度：{progress:.1f}% | 已预测：{len(all_pred_data)}/{target_total_points} 点", end='\r')
+
+    # 截断到目标点数（避免超出）
+    all_pred_data = all_pred_data[:target_total_points]
+    all_pred_time = all_pred_time[:target_total_points]
+
+    # 逆标准化
+    pred_data_scaled = np.array(all_pred_data).reshape(-1, 1)
+    pred_data_inversed = scaler.inverse_transform(pred_data_scaled)
+    pred_time = np.array(all_pred_time)
+
+    print(f"\n✅ 步进式预测完成：总预测{len(pred_data_inversed)}点，单次窗口{seq_length}，单次预测{predict_step}点")
+    return pred_time, pred_data_inversed
 
 def plot_predicted_data(time_data, predicted_data_inversed):
     # 绘制预测结果
@@ -275,28 +389,28 @@ def plot_predicted_data(time_data, predicted_data_inversed):
 # ========== 新增：你需要的双图对比绘制函数 ==========
 def plot_double_figure(true_data, time_true, pred_data, time_pred):
     """
-    绘制两张对比图：
-    图1：真实数据 + 预测数据在同一张图对比
-    图2：仅预测数据的独立展示图
+    绘制两张对比图（x轴为采样点序号，替代时间）：
+    图1：真实数据 + 预测数据对比
+    图2：仅预测数据独立展示
     """
-    # 图1：真实数据 vs 预测数据（对比图）
+    # 图1：真实电压 vs 预测电压（x轴为采样点序号）
     plt.figure(figsize=(12, 5))
     plt.plot(time_true, true_data['Voltage'].values, label='真实电压', alpha=0.7, color='blue')
     plt.plot(time_pred, pred_data, label='预测电压', alpha=0.7, color='red')
-    plt.xlabel('时间 (s)')
+    plt.xlabel('采样点序号')  # 替换为采样点
     plt.ylabel('电压 (V)')
-    plt.title('真实电压 vs 预测电压对比')
+    plt.title('真实电压 vs 预测电压对比（采样点序号）')
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()
 
-    # 图2：仅预测数据（独立展示）
+    # 图2：仅预测电压（x轴为采样点序号）
     plt.figure(figsize=(12, 5))
     plt.plot(time_pred, pred_data, color='red', label='预测电压')
-    plt.xlabel('时间 (s)')
+    plt.xlabel('采样点序号')  # 替换为采样点
     plt.ylabel('电压 (V)')
-    plt.title('预测电压随时间变化')
+    plt.title('预测电压随采样点变化')
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -304,33 +418,33 @@ def plot_double_figure(true_data, time_true, pred_data, time_pred):
 
 
 
-# 主函数
-def main():  # 旧有数据的实验
-    # *******步骤1：训练部分
-    file_nameA = 'RigolDS0.csv'
-
-    dataA=extract_data_from_csv(file_nameA)
-    scaler = train_lstm_model(dataA, seq_length=32, save_path='./')
-
-
-
-
-    # *******步骤2：预测部分
-    dataB = extract_data_from_csv('RigolDS1.csv')
-    time_data, predicted_data_inversed = predict_with_sliding_window_fixed(dataB, seq_length=32,
-                                                                     model_path='./lstm_attention_model_full_dataA.h5',
-                                                                     scaler_path='./scaler.pkl',
-                                                                     future_steps=16,
-                                                                     total_steps=62)  # 62*16=992≈1000个点
-
-    # 同时绘制真实数据和预测数据（方便对比）
-    plt.figure(figsize=(12, 6))
-    plt.plot(dataB['Time(s)'].values, dataB['CH1V'].values, label='TrueData', alpha=0.7)
-    plt.plot(time_data, predicted_data_inversed, label='PredictData', color='red', alpha=0.7)
-    plt.xlabel("Time")
-    plt.ylabel("Voltage")
-    plt.legend()
-    plt.show()
+# # 主函数
+# def main():  # 旧有数据的实验
+#     # *******步骤1：训练部分
+#     file_nameA = 'RigolDS0.csv'
+#
+#     dataA=extract_data_from_csv(file_nameA)
+#     scaler = train_lstm_model(dataA, seq_length=32, save_path='./')
+#
+#
+#
+#
+#     # *******步骤2：预测部分
+#     dataB = extract_data_from_csv('RigolDS1.csv')
+#     time_data, predicted_data_inversed = predict_with_sliding_window_fixed(dataB, seq_length=32,
+#                                                                      model_path='./lstm_attention_model_full_dataA.h5',
+#                                                                      scaler_path='./scaler.pkl',
+#                                                                      future_steps=16,
+#                                                                      total_steps=62)  # 62*16=992≈1000个点
+#
+#     # 同时绘制真实数据和预测数据（方便对比）
+#     plt.figure(figsize=(12, 6))
+#     plt.plot(dataB['Time(s)'].values, dataB['CH1V'].values, label='TrueData', alpha=0.7)
+#     plt.plot(time_data, predicted_data_inversed, label='PredictData', color='red', alpha=0.7)
+#     plt.xlabel("Time")
+#     plt.ylabel("Voltage")
+#     plt.legend()
+#     plt.show()
 
 
     # plot_predicted_data(dataB['Time(s)'].values, dataB['CH1V'].values)
@@ -341,6 +455,6 @@ def main():  # 旧有数据的实验
     # save_to_csv(time_data, voltage_data)
 
 
-
-if __name__ == "__main__":
-    main()
+#
+# if __name__ == "__main__":
+#     main()
