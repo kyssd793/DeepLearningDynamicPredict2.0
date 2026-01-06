@@ -476,3 +476,37 @@ def balanced_smooth_with_spike(data_df, wavelet='db4', level=3):
 
     enhanced_df = pd.DataFrame({'Voltage': enhanced_voltage})
     return enhanced_df
+
+
+def downsample_to_target_count(data_df, target_count=20000, preserve_peak=True):
+    """
+    定向降采样到指定条数（核心：按比例降采样，保留峰值/基频）
+    :param data_df: 原始DataFrame（Voltage列）
+    :param target_count: 目标条数（默认2w）
+    :param preserve_peak: 是否保留脉冲尖峰（默认True）
+    :return: 降采样后的DataFrame、降采样后采样率
+    """
+    original_count = len(data_df)
+    original_sr = 50000  # 原始采样率50kHz=100w/20s
+
+    # 计算降采样因子（按条数比例）
+    downsample_factor = original_count / target_count
+    if downsample_factor < 1:
+        print(f"⚠️ 目标条数{target_count}大于原始条数{original_count}，无需降采样")
+        return data_df, original_sr
+
+    # 取整（保证降采样后条数接近目标值）
+    downsample_factor = int(np.round(downsample_factor))
+    print(f"✅ 降采样因子：{downsample_factor}（原始{original_count}条 → 目标{target_count}条）")
+
+    # 选择降采样方式（保留峰值优先）
+    if preserve_peak:
+        down_df, down_sr = downsample_data_peak_preserve_signed(data_df, downsample_factor=downsample_factor)
+    else:
+        down_df, down_sr = downsample_data_linear(data_df, downsample_factor=downsample_factor)
+
+    # 最终截断/补全到目标条数（确保精准2w条）
+    final_df = down_df.iloc[:target_count].reset_index(drop=True)
+    print(f"✅ 降采样完成：原始{original_count}条 → 最终{len(final_df)}条（目标{target_count}条）")
+
+    return final_df, down_sr

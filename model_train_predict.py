@@ -28,6 +28,46 @@ def save_to_csv(time_data, predicted_data_inversed, filename):
     df.to_csv(filename, index=False)
 
 
+def save_comparison_plot(true_data, pred_data, time_true, time_pred,
+                            filename='prediction_comparison.png', dpi=300):
+    # 创建画布（适配大量数据的尺寸）
+    fig, ax = plt.subplots(figsize=(15, 6), dpi=dpi)
+
+    # 绘制真实数据（绿色）
+    ax.plot(time_true, true_data['Voltage'].values,
+            color='#2ecc71', label='True Data', alpha=0.8, linewidth=0.8)
+    # 绘制预测数据（红色）
+    ax.plot(time_pred, pred_data,
+            color='#e74c3c', label='Predicted Data', alpha=0.8, linewidth=0.8)
+
+    # 图表配置（英文标签，避免字体问题）
+    ax.set_xlabel('Sample Index', fontsize=12)
+    ax.set_ylabel('Voltage (V)', fontsize=12)
+    ax.set_title('True vs Predicted Voltage Comparison', fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+
+    # 紧凑布局，避免裁剪
+    plt.tight_layout()
+    # 保存图片（高清，无白边）
+    plt.savefig(filename, bbox_inches='tight', pad_inches=0.1)
+    plt.close()  # 关闭画布，释放内存
+
+    print(f"✅ 对比图已保存为PNG：{os.path.abspath(filename)}")
+    return os.path.abspath(filename)
+
+def save_prediction_to_csv(pred_data, filename='prediction_result.csv'):
+    # 展平数据为一维，确保单列
+    pred_data_flat = pred_data.flatten()
+    # 创建单列DataFrame
+    df = pd.DataFrame({
+        'Predicted_Voltage': pred_data_flat
+    })
+    # 保存CSV（无索引，仅数据）
+    df.to_csv(filename, index=False, header=False)
+    print(f"✅ 预测数据已保存为CSV：{os.path.abspath(filename)}")
+    return os.path.abspath(filename)
+
 def ensemble_loss(y_true, y_pred, a=0.3, b=0.7):
     # a=0.3 b=0.7 55开时候应该最好，强于37，强于64
     # 现在是64最好，且要每次不用模型预测
@@ -238,7 +278,7 @@ def predict_with_sliding_window_fixed(dataB, seq_length=32, model_weights_path='
         raise ValueError(f"数据B长度不足！X_test仅{len(X_test)}个样本，无法完成至少1段预测")
 
     # 加载模型
-    model = tf.keras.models.load_model(model_path, custom_objects={'ensemble_loss': ensemble_loss})
+    model = tf.keras.models.load_model(model_weights_path, custom_objects={'ensemble_loss': ensemble_loss})
 
     all_predicted_data = []
     time_list = []  # 现在存储的是采样点序号，替代Time(s)
@@ -288,6 +328,8 @@ def predict_stepped_window_fast(dataB, seq_length=32, model_weights_path='./lstm
     import pickle
     import numpy as np
     from tensorflow.keras.models import load_model
+    import tensorflow as tf
+
 
     # 1. 加载scaler和模型
     with open(scaler_path, 'rb') as f:
@@ -417,44 +459,3 @@ def plot_double_figure(true_data, time_true, pred_data, time_pred):
     plt.show()
 
 
-
-# # 主函数
-# def main():  # 旧有数据的实验
-#     # *******步骤1：训练部分
-#     file_nameA = 'RigolDS0.csv'
-#
-#     dataA=extract_data_from_csv(file_nameA)
-#     scaler = train_lstm_model(dataA, seq_length=32, save_path='./')
-#
-#
-#
-#
-#     # *******步骤2：预测部分
-#     dataB = extract_data_from_csv('RigolDS1.csv')
-#     time_data, predicted_data_inversed = predict_with_sliding_window_fixed(dataB, seq_length=32,
-#                                                                      model_path='./lstm_attention_model_full_dataA.h5',
-#                                                                      scaler_path='./scaler.pkl',
-#                                                                      future_steps=16,
-#                                                                      total_steps=62)  # 62*16=992≈1000个点
-#
-#     # 同时绘制真实数据和预测数据（方便对比）
-#     plt.figure(figsize=(12, 6))
-#     plt.plot(dataB['Time(s)'].values, dataB['CH1V'].values, label='TrueData', alpha=0.7)
-#     plt.plot(time_data, predicted_data_inversed, label='PredictData', color='red', alpha=0.7)
-#     plt.xlabel("Time")
-#     plt.ylabel("Voltage")
-#     plt.legend()
-#     plt.show()
-
-
-    # plot_predicted_data(dataB['Time(s)'].values, dataB['CH1V'].values)
-    # plot_predicted_data(time_data, predicted_data_inversed)
-    # save_to_csv(time_data, predicted_data_inversed,'1113test.csv')
-    # train_lstm_model(dataA) # 训练模型
-    # plot_voltage_time(dataA)
-    # save_to_csv(time_data, voltage_data)
-
-
-#
-# if __name__ == "__main__":
-#     main()
