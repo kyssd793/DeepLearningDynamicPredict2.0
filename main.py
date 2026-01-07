@@ -7,13 +7,27 @@ import model_train_predict as mtp
 import os
 import tensorflow as tf
 
-# 提前设置GPU可见性（在所有TensorFlow操作之前执行）
+# 1. 强制暴露所有GPU（关键！）
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+# 2. 开启显存动态增长
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+
+# 3. 重新获取GPU列表（此时能看到所有4块）
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
-    # 只使用第一个GPU（和原逻辑一致）
-    tf.config.set_visible_devices(gpus[0], 'GPU')
-    tf.config.experimental.set_memory_growth(gpus[0], True)
-    print(f"✅ 已绑定GPU: {gpus[0]}")
+    # 打印所有可用GPU（确认能看到2号）
+    print(f"📌 服务器可用GPU列表：{[gpu.name for gpu in gpus]}")
+
+    # 4. 指定绑定2号GPU（索引2）
+    target_gpu_idx = 2
+    if target_gpu_idx < len(gpus):
+        # 只让TensorFlow使用2号GPU
+        tf.config.set_visible_devices(gpus[target_gpu_idx], 'GPU')
+        # 开启2号GPU的显存动态增长
+        tf.config.experimental.set_memory_growth(gpus[target_gpu_idx], True)
+        print(f"✅ 已绑定2号GPU: {gpus[target_gpu_idx].name} (4090)")
+    else:
+        print(f"⚠️ 2号GPU不存在，可用GPU数量：{len(gpus)}")
 else:
     print("⚠️ 未检测到GPU，使用CPU运行")
 
@@ -23,60 +37,40 @@ if __name__ == "__main__":
     # 1. 读取原始数据
     csv_path = "fix150.csv"
     raw_df = dp.extract_single_column_csv(csv_path)
-    # dp.plot_voltage_single_column(raw_df, title_suffix="（原始数据）")
+    dp.plot_voltage_single_column(raw_df, title_suffix="（原始数据）")
 
 
     # 2. 核心步骤1：定向降采样到2w条（优先执行！）
     target_count = 20000  # 目标2w条
     down_df_2w, down_sr_2w = dp.downsample_to_target_count(raw_df, target_count=target_count)
     print(f"✅ 降采样到2w条完成，采样率：{down_sr_2w} Hz")
-    # dp.plot_voltage_single_column(down_df_2w, title_suffix="（定向降采样到2w条后）")
+    dp.plot_voltage_single_column(down_df_2w, title_suffix="（定向降采样到2w条后）")
 
     # 3. 核心步骤2：用降采样后的数据找10Hz内的真实基频
     real_base_freq = dp.plot_spectrum_base_freq(down_df_2w, down_sr_2w, top_n=3)
 
-
-    # # 2. 核心步骤：用原始数据找10Hz内的真实基频（关键！）
-    # raw_sr = 50000
-    # real_base_freq = dp.plot_spectrum_base_freq(raw_df, raw_sr, top_n=3)
-
-    # 4. 平衡版平滑（保留尖峰+渐变）
-    balanced_df = dp.wavelet_denoise_with_envelope_fix(down_df_2w, wavelet='db4', level=3)
+    # 4. 适用于lstm处理的数据
+    balanced_df = dp.enhance_lstm_feature_slim(down_df_2w, down_sr_2w, real_base_freq)
     print(f"✅ 预处理完成（2w条数据+异常值清理+平衡版平滑）")
-    # dp.plot_voltage_single_column(balanced_df, title_suffix="（2w条数据+异常值清理+平衡版平滑后）")
+    dp.plot_voltage_single_column(balanced_df, title_suffix="（2w条数据+异常值清理+平衡版平滑后）")
 
-    # # 3. 峰值降采样（保留脉冲尖峰）
-    # down_df, down_sr = dp.downsample_data_peak_preserve_signed(raw_df, downsample_factor=5)
-    # dp.plot_voltage_single_column(down_df, title_suffix="（峰值降采样后，未降噪）")
-    #
-    # # # 4. 新增：异常值清理（删除突然的异常尖峰）
-    # # cleaned_df = remove_sudden_spikes(down_df, slope_threshold=10)
-    # # plot_voltage_single_column(cleaned_df, title_suffix="（异常值清理后）")
-    #
-    # # 5. 平衡版平滑（保留尖峰+渐变）
-    # balanced_df = dp.wavelet_denoise_with_envelope_fix(down_df, wavelet='db4', level=3)
-    # print(f"✅ 预处理完成（异常值清理+平衡版平滑）")
-    # dp.plot_voltage_single_column(balanced_df, title_suffix="（异常值清理+平衡版平滑后）")
-
-    # ===================== 2. 训练模型 =====================
+    # 5. ===================== 训练模型 =====================
     print("\n===== 开始训练模型 =====")
     # 模型/scaler保存到当前同级目录（无需创建子文件夹）
     save_path = './'  # 关键：改为当前目录
 
-    # 调用滚动训练函数
-    model, scaler = mtp.train_lstm_attention_model(
-        preprocessed_df=balanced_df,  # 预处理后的Voltage列数据
-        seq_length=32,  # 时间步长（和你一致）
-        save_path=save_path,  # 保存到当前目录
-        roll_window_ratio=0.2,  # 验证窗口20%
-        roll_step_ratio=0.1  # 滚动步长10%
+    # 修改调用代码，接收3个返回值
+    model, window_scalers, global_scaler = mtp.train_lstm_attention_model_local_scaler(
+        preprocessed_df=balanced_df,
+        seq_length=32,
+        save_path=save_path,
     )
     print(f"✅ 模型训练完成！模型文件：{os.path.join(save_path, 'lstm_attention_piezo_model')}")
 
     # ===================== 第三步：滑窗预测（单独执行，用同级目录的模型） =====================
     print("\n===== 开始滑窗预测 =====")
     # 预测数据用预处理后的balanced_df（也可替换为新测试数据）
-    dataB = balanced_df.copy()
+    inputData = balanced_df.copy()
 
     # # 调用适配后的预测函数（无Time(s)列，采样点序号为时间轴）
     # time_pred, pred_data = mtp.predict_with_sliding_window_fixed(
@@ -87,32 +81,47 @@ if __name__ == "__main__":
     #     future_steps=16,  # 单次预测16点（你的核心逻辑）
     # )
     # 在main.py的预测阶段替换为：
-    time_pred, pred_data = mtp.predict_stepped_window_fast(
-        dataB=dataB,
-        seq_length=32,  # 输入窗口32个点
-        model_weights_path='./lstm_model_weights.h5',
-        scaler_path='./scaler_piezo.pkl',
-        predict_step=32,  # 单次预测32个点（和窗口等长）
-        target_total_points=20000  # 目标预测20万点（和原始数据一致）
+    # time_pred, pred_data = mtp.predict_stepped_window_fast(
+    #     dataB=inputData,
+    #     seq_length=32,  # 输入窗口32个点
+    #     model_weights_path='./lstm_model_weights.h5',
+    #     scaler_path='./scaler_piezo.pkl',
+    #     predict_step=32,  # 单次预测32个点（和窗口等长）
+    #     target_total_points=1000  # 目标预测2万点
+    # )
+    time_pred, pred_data = mtp.predict_old_local_scaler(
+        dataB=inputData,
+        seq_length=32,
+        save_path=save_path,
+        ratio=2
     )
     # ===================== 绘图 =====================
     print("\n===== 生成图片和数据 =====")
     # 修复1：展平pred_data为一维数组（避免维度不匹配）
     pred_data_flat = pred_data.flatten()
     # 修复2：确保time_true和time_pred维度匹配
-    time_true = np.arange(len(dataB))
+    time_true = np.arange(len(inputData))
 
-    mtp.save_prediction_to_csv(pred_data_flat, filename='prediction_result_fix15.csv')
-    mtp.save_comparison_plot(
-        true_data=dataB,
-        pred_data=pred_data_flat,
-        time_true=time_true,
-        time_pred=time_pred,
-        filename='prediction_comparison.png'
+    # =====================只会绘图不看 =====================
+    print("\n===== 绘制真实/预测对比图 =====")
+    mtp.plot_double_figure(
+        true_data=inputData,       # 真实数据（balanced_df）
+        time_true=time_true,       # 真实数据的采样点序号
+        pred_data=pred_data_flat,  # 展平后的预测数据
+        time_pred=time_pred        # 预测数据的采样点序号
     )
-    print("\n===== 执行完成！生成的文件： =====")
-    print(f"1. 预测数据CSV：{os.path.abspath('prediction_result.csv')}")
-    print(f"2. 对比图PNG：{os.path.abspath('prediction_comparison.png')}")
+
+    # mtp.save_prediction_to_csv(pred_data_flat, filename='prediction_result_fix15_0107.csv')
+    # mtp.save_comparison_plot(
+    #     true_data=inputData,
+    #     pred_data=pred_data_flat,
+    #     time_true=time_true,
+    #     time_pred=time_pred,
+    #     filename='prediction_comparison_0107.png'
+    # )
+    # print("\n===== 执行完成！生成的文件： =====")
+    # print(f"1. 预测数据CSV：{os.path.abspath('prediction_result_fix15_0107.csv')}")
+    # print(f"2. 对比图PNG：{os.path.abspath('prediction_comparison_0107.png')}")
 
     # ===================== 第四步：保存预测结果（同级目录，无绘图） =====================
     # print("\n===== 保存预测结果 =====")
