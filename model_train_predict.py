@@ -73,14 +73,42 @@ def ensemble_loss(y_true, y_pred, a=0.3, b=0.7):
     loss2 = tf.abs(y_true - y_pred)
     return a * loss1 + b * loss2
 
+# 测试用
+def huber_extreme_loss(y_true, y_pred, delta=0.1, extreme_weight=2.0):
+    # 计算误差
+    error = y_true - y_pred
+    # Huber损失：对小误差用MSE，大误差用MAE
+    huber_loss = tf.where(
+        tf.abs(error) <= delta,
+        0.5 * tf.square(error),
+        delta * (tf.abs(error) - 0.5 * delta)
+    )
+    # 对极值点（误差>delta）增加权重
+    extreme_mask = tf.cast(tf.abs(error) > delta, dtype=tf.float32)
+    weighted_loss = huber_loss + (extreme_mask * (extreme_weight - 1) * huber_loss)
+    return tf.reduce_mean(weighted_loss)
 
-# 全局标准化函数（训练和预测用同一个scaler）
-def create_scaler(data):
-    """基于训练数据创建scaler，供后续预测使用"""
-    scaler = MinMaxScaler()
-    scaler.fit(data[['Voltage']])
-    return scaler
-
+def adjustable_loss(y_true, y_pred,
+                    mse_weight=0.0,  # 降低MSE权重（之前是0.3/0.7）
+                    mae_weight=1.0,  # 提高MAE权重（对小幅值更友好）
+                    extreme_threshold=0.05,  # 极值判定阈值（数据幅值小，阈值也调小）
+                    extreme_weight=2.5):  # 极值惩罚权重（比之前更高）
+    """
+    可调节的损失函数：
+    - mse_weight：MSE的权重（建议0.1~0.3）
+    - mae_weight：MAE的权重（建议0.7~0.9）
+    - extreme_threshold：超过该阈值的误差视为“极值误差”
+    - extreme_weight：极值误差的额外惩罚权重
+    """
+    # 计算MSE和MAE
+    mse = tf.square(y_true - y_pred)
+    mae = tf.abs(y_true - y_pred)
+    # 基础损失（MSE+MAE加权）
+    base_loss = mse_weight * mse + mae_weight * mae
+    # 极值误差惩罚：对超过threshold的误差，额外乘以extreme_weight
+    extreme_mask = tf.cast(tf.abs(y_true - y_pred) > extreme_threshold, dtype=tf.float32)
+    weighted_loss = base_loss + (extreme_mask * (extreme_weight - 1) * base_loss)
+    return tf.reduce_mean(weighted_loss)
 
 # 构建数据集（不变）
 def create_sequences(data_scaled, seq_length=32):
@@ -111,209 +139,195 @@ def build_unified_model(seq_length=32):
     lstm2 = Dropout(0.1)(lstm2)
     outputs = Dense(1)(lstm2)
     model = Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer='adam', loss=ensemble_loss)
+    model.compile(optimizer='adam', loss=lambda yt, yp: huber_extreme_loss(yt, yp, delta=0.1, extreme_weight=2.0))
+    # model.compile(
+    #     optimizer='adam',
+    #     # 重点：调整mse_weight和extreme_weight
+    #     loss=lambda yt, yp: adjustable_loss(
+    #         yt, yp,
+    #         mse_weight=0.0,    # MSE权重再降（之前0.3）
+    #         mae_weight=1.0,    # MAE权重再升（对小幅值更友好）
+    #         extreme_threshold=0.03,  # 阈值调小（适配小幅值数据）
+    #         extreme_weight=2.0  # 极值惩罚
+    #     )
+    # )
     return model
 
 
-# 不太行，已经弃之不用。
-def train_lstm_attention_model(preprocessed_df, seq_length=32, save_path='./',
-                               roll_window_ratio=0.2, roll_step_ratio=0.1):
-    """
-    核心改进：优先加载已有模型/Scaler，无文件时才重新训练
-    :return: 模型、scaler
-    """
-    # 模型/Scaler路径
-    model_weights_path = os.path.join(save_path, 'lstm_model_weights.h5')
-    scaler_path = os.path.join(save_path, 'scaler_piezo.pkl')
+# 核心：重构后的滑动窗口训练函数.保留，问题就是预测幅度过小的主要问题
+# def train_lstm_attention_model_2(preprocessed_df, seq_length=32, save_path='./',
+#                                window_ratio=0.5, val_ratio=0.1, step_ratio=0.5):
+#     """
+#     适配时序特征变化的滑动窗口训练函数
+#     :param preprocessed_df: 预处理后的DataFrame（含Voltage列）
+#     :param seq_length: 序列窗口长度
+#     :param save_path: 模型保存路径
+#     :param window_ratio: 训练窗口占总样本的比例（默认10%）
+#     :param val_ratio: 验证集占训练窗口的比例（默认20%）
+#     :param step_ratio: 窗口滑动步长占训练窗口的比例（默认50%）
+#     :return: 最优模型、全局scaler
+#     """
+#     # 模型/Scaler路径（保留原有命名）
+#     model_weights_path = os.path.join(save_path, 'lstm_model_weights.h5')
+#     scaler_path = os.path.join(save_path, 'scaler_piezo.pkl')
+#
+#     # ========== 优先加载已有模型（保留原有逻辑） ==========
+#     if os.path.exists(model_weights_path) and os.path.exists(scaler_path):
+#         with open(scaler_path, 'rb') as f:
+#             scaler = pickle.load(f)
+#         model = build_unified_model(seq_length)
+#         model.load_weights(model_weights_path)
+#         print(f"✅ 已加载已有模型：{model_weights_path}")
+#         print(f"✅ 已加载已有Scaler：{scaler_path}")
+#         return model, scaler
+#
+#     # ========== 滑动窗口训练核心逻辑 ==========
+#     print("⚠️ 未检测到已有模型/Scaler，开始滑动窗口训练...")
+#
+#     # 全局标准化（保留原有逻辑，如需局部标准化可在此修改）
+#     scaler = MinMaxScaler()
+#     data_scaled = scaler.fit_transform(preprocessed_df[['Voltage']])
+#     print(f"训练时data_scaled范围：min={data_scaled.min()}, max={data_scaled.max()}")  # 正常应为0.0~1.0
+#     print(f"训练scaler的data_min_={scaler.data_min_[0]}, data_max_={scaler.data_max_[0]}")  # 应为真实数据的min/max
+#     X_all, y_all = create_sequences(data_scaled, seq_length)
+#     total_samples = len(X_all)
+#
+#     # 计算滑动窗口参数（适配时序特征变化）
+#     window_size = int(total_samples * window_ratio)  # 训练窗口大小
+#     val_size = int(window_size * val_ratio)  # 验证集大小
+#     step = int(window_size * step_ratio)  # 窗口滑动步长
+#
+#     # 边界校验
+#     if window_size < 100 or val_size < 20:
+#         raise ValueError("窗口过小！请增大window_ratio或确保数据量充足")
+#     if window_size + val_size >= total_samples:
+#         raise ValueError("窗口+验证集超过总样本！请减小window_ratio/val_ratio")
+#
+#     best_val_loss = float('inf')
+#     best_model_weights = None
+#
+#     # 滑动窗口训练循环
+#     for start in range(0, total_samples - window_size - val_size, step):
+#         # 1. 划分当前窗口的训练/验证集（纯局部数据，非累加）
+#         X_train = X_all[start:start + window_size]
+#         y_train = y_all[start:start + window_size]
+#         X_val = X_all[start + window_size:start + window_size + val_size]
+#         y_val = y_all[start + window_size:start + window_size + val_size]
+#
+#         # 2. 每个窗口重新初始化模型（避免增量过拟合）
+#         model = build_unified_model(seq_length)
+#
+#         # 3. epoch训练
+#         print(f"\n=== 滑动窗口 {start // step + 1} ===")
+#         print(f"训练窗口：{start} ~ {start + window_size}（共{len(X_train)}样本）")
+#         print(f"验证窗口：{start + window_size} ~ {start + window_size + val_size}（共{len(X_val)}样本）")
+#
+#         history = model.fit(
+#             X_train, y_train,
+#             epochs=3,  # 时序窗口训练epoch不宜过多
+#             batch_size=32,
+#             validation_data=(X_val, y_val),
+#             verbose=1,
+#             shuffle=False  # 时序数据禁止shuffle
+#         )
+#
+#         # 4. 记录最优模型（保留验证损失最低的）
+#         current_val_loss = history.history['val_loss'][-1]
+#         print(f"当前窗口验证损失：{current_val_loss:.4f}")
+#
+#         if current_val_loss < best_val_loss:
+#             best_val_loss = current_val_loss
+#             best_model_weights = model.get_weights()
+#             print(f"📈 更新最优模型（验证损失：{best_val_loss:.4f}）")
+#
+#     # ========== 保存最优模型 ==========
+#     if best_model_weights is None:
+#         raise RuntimeError("无有效训练窗口！请检查数据量或窗口参数")
+#
+#     # 加载最优权重并保存
+#     final_model = build_unified_model(seq_length)
+#     final_model.set_weights(best_model_weights)
+#     final_model.save_weights(model_weights_path)
+#
+#     # 保存scaler
+#     with open(scaler_path, 'wb') as f:
+#         pickle.dump(scaler, f)
+#
+#     print(f"\n✅ 滑动窗口训练完成！")
+#     print(f"📊 最优验证损失：{best_val_loss:.4f}")
+#     print(f"💾 模型保存至：{model_weights_path}")
+#     print(f"💾 Scaler保存至：{scaler_path}")
+#
+#     return final_model, scaler
 
-    # ========== 关键：优先加载已有文件 ==========
-    if os.path.exists(model_weights_path) and os.path.exists(scaler_path):
-        # 加载已有Scaler
-        with open(scaler_path, 'rb') as f:
-            scaler = pickle.load(f)
-        # 加载已有模型
-        model = build_unified_model(seq_length)
-        model.load_weights(model_weights_path)
-        print(f"✅ 已加载已有模型：{model_weights_path}")
-        print(f"✅ 已加载已有Scaler：{scaler_path}")
-        return model, scaler
-
-    # ========== 无文件时才重新训练 ==========
-    print("⚠️ 未检测到已有模型/Scaler，开始重新训练...")
-    scaler = create_scaler(preprocessed_df)
-    data_scaled = scaler.transform(preprocessed_df[['Voltage']])
-
-    # 构建完整序列数据集
-    X_all, y_all = create_sequences(data_scaled, seq_length)
-    total_samples = len(X_all)
-
-    # 滚动验证参数计算
-    val_window_size = int(total_samples * roll_window_ratio)
-    roll_step = int(total_samples * roll_step_ratio)
-    if val_window_size == 0 or roll_step == 0:
-        raise ValueError("数据量过小，无法进行滚动验证！请增大数据量或调整窗口/步长比例")
-
-    # 初始化模型
-    model = build_unified_model(seq_length)
-
-    # 滚动验证训练
-    start_idx = 0
-    val_loss_list = []
-    while start_idx + val_window_size <= total_samples:
-        # 划分训练/验证窗口
-        train_end_idx = start_idx
-        val_start_idx = train_end_idx
-        val_end_idx = val_start_idx + val_window_size
-
-        X_train = X_all[:train_end_idx] if train_end_idx > 0 else X_all[:val_start_idx]
-        y_train = y_all[:train_end_idx] if train_end_idx > 0 else y_all[:val_start_idx]
-        X_val = X_all[val_start_idx:val_end_idx]
-        y_val = y_all[val_start_idx:val_end_idx]
-
-        # 跳过样本不足的情况
-        if len(X_train) < 100 or len(X_val) < 50:
-            start_idx += roll_step
-            continue
-
-        # 训练当前窗口
-        print(f"\n=== 滚动窗口 {start_idx // roll_step + 1} ===")
-        print(f"训练集：0 ~ {train_end_idx if train_end_idx > 0 else val_start_idx} 样本")
-        print(f"验证集：{val_start_idx} ~ {val_end_idx} 样本")
-
-        history = model.fit(
-            X_train, y_train,
-            epochs=10,
-            batch_size=32,
-            validation_data=(X_val, y_val),
-            verbose=1,
-            shuffle=False
-        )
-
-        # 记录验证损失
-        val_loss = history.history['val_loss'][-1]
-        val_loss_list.append(val_loss)
-        print(f"当前窗口验证损失：{val_loss:.4f}")
-
-        # 滚动到下一个窗口
-        start_idx += roll_step
-
-    # 保存训练好的模型和scaler
-    model.save_weights(model_weights_path)
-    print(f"\n✅ 模型权重已保存：{model_weights_path}")
-    print(f"平均验证损失：{np.mean(val_loss_list):.4f}")
-
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-    print(f"✅ Scaler已保存：{scaler_path}")
-
-    return model, scaler
-
-
-# 核心：重构后的滑动窗口训练函数
+# 去掉保存scale测试版本
 def train_lstm_attention_model_2(preprocessed_df, seq_length=32, save_path='./',
-                               window_ratio=0.1, val_ratio=0.2, step_ratio=0.5):
+                               window_ratio=0.8, val_ratio=0.1, step_ratio=0.5):
     """
-    适配时序特征变化的滑动窗口训练函数
-    :param preprocessed_df: 预处理后的DataFrame（含Voltage列）
-    :param seq_length: 序列窗口长度
-    :param save_path: 模型保存路径
-    :param window_ratio: 训练窗口占总样本的比例（默认10%）
-    :param val_ratio: 验证集占训练窗口的比例（默认20%）
-    :param step_ratio: 窗口滑动步长占训练窗口的比例（默认50%）
-    :return: 最优模型、全局scaler
+    简化版训练函数：不保存scaler，只保存模型权重，返回model+scaler
     """
-    # 模型/Scaler路径（保留原有命名）
     model_weights_path = os.path.join(save_path, 'lstm_model_weights.h5')
-    scaler_path = os.path.join(save_path, 'scaler_piezo.pkl')
+    # 移除scaler_path相关代码
 
-    # ========== 优先加载已有模型（保留原有逻辑） ==========
-    if os.path.exists(model_weights_path) and os.path.exists(scaler_path):
-        with open(scaler_path, 'rb') as f:
-            scaler = pickle.load(f)
+    # ========== 加载已有模型（仅加载权重，不加载scaler） ==========
+    scaler = None
+    model = None
+    if os.path.exists(model_weights_path):
         model = build_unified_model(seq_length)
         model.load_weights(model_weights_path)
-        print(f"✅ 已加载已有模型：{model_weights_path}")
-        print(f"✅ 已加载已有Scaler：{scaler_path}")
-        return model, scaler
+        print(f"✅ 已加载已有模型权重：{model_weights_path}")
+        # 注意：加载模型时无法恢复scaler，因此如果是加载已有模型，需要重新fit scaler
+        scaler = MinMaxScaler()
+        scaler.fit(preprocessed_df[['Voltage']])  # 重新用当前数据fit scaler
+    else:
+        # ========== 重新训练 ==========
+        print("⚠️ 未检测到已有模型，开始滑动窗口训练...")
+        # 全局标准化（fit当前数据）
+        scaler = MinMaxScaler()
+        data_scaled = scaler.fit_transform(preprocessed_df[['Voltage']])
+        X_all, y_all = create_sequences(data_scaled, seq_length)
+        total_samples = len(X_all)
 
-    # ========== 滑动窗口训练核心逻辑 ==========
-    print("⚠️ 未检测到已有模型/Scaler，开始滑动窗口训练...")
+        window_size = int(total_samples * window_ratio)
+        val_size = int(window_size * val_ratio)
+        step = int(window_size * step_ratio)
 
-    # 全局标准化（保留原有逻辑，如需局部标准化可在此修改）
-    scaler = MinMaxScaler()
-    data_scaled = scaler.fit_transform(preprocessed_df[['Voltage']])
-    X_all, y_all = create_sequences(data_scaled, seq_length)
-    total_samples = len(X_all)
+        best_val_loss = float('inf')
+        best_model_weights = None
 
-    # 计算滑动窗口参数（适配时序特征变化）
-    window_size = int(total_samples * window_ratio)  # 训练窗口大小
-    val_size = int(window_size * val_ratio)  # 验证集大小
-    step = int(window_size * step_ratio)  # 窗口滑动步长
+        for start in range(0, total_samples - window_size - val_size, step):
+            X_train = X_all[start:start + window_size]
+            y_train = y_all[start:start + window_size]
+            X_val = X_all[start + window_size:start + window_size + val_size]
+            y_val = y_all[start + window_size:start + window_size + val_size]
 
-    # 边界校验
-    if window_size < 100 or val_size < 20:
-        raise ValueError("窗口过小！请增大window_ratio或确保数据量充足")
-    if window_size + val_size >= total_samples:
-        raise ValueError("窗口+验证集超过总样本！请减小window_ratio/val_ratio")
+            model = build_unified_model(seq_length)
+            print(f"\n=== 滑动窗口 {start // step + 1} ===")
+            history = model.fit(
+                X_train, y_train,
+                epochs=15,  # 足够训练
+                batch_size=64,
+                validation_data=(X_val, y_val),
+                verbose=1,
+                shuffle=False
+            )
 
-    best_val_loss = float('inf')
-    best_model_weights = None
+            current_val_loss = history.history['val_loss'][-1]
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                best_model_weights = model.get_weights()
 
-    # 滑动窗口训练循环
-    for start in range(0, total_samples - window_size - val_size, step):
-        # 1. 划分当前窗口的训练/验证集（纯局部数据，非累加）
-        X_train = X_all[start:start + window_size]
-        y_train = y_all[start:start + window_size]
-        X_val = X_all[start + window_size:start + window_size + val_size]
-        y_val = y_all[start + window_size:start + window_size + val_size]
+        # 保存模型权重（仅保存权重，不保存scaler）
+        final_model = build_unified_model(seq_length)
+        final_model.set_weights(best_model_weights)
+        final_model.save_weights(model_weights_path)
+        print(f"\n✅ 模型权重保存至：{model_weights_path}")
+        model = final_model
 
-        # 2. 每个窗口重新初始化模型（避免增量过拟合）
-        model = build_unified_model(seq_length)
-
-        # 3. 少量epoch训练（时序窗口避免过拟合）
-        print(f"\n=== 滑动窗口 {start // step + 1} ===")
-        print(f"训练窗口：{start} ~ {start + window_size}（共{len(X_train)}样本）")
-        print(f"验证窗口：{start + window_size} ~ {start + window_size + val_size}（共{len(X_val)}样本）")
-
-        history = model.fit(
-            X_train, y_train,
-            epochs=3,  # 时序窗口训练epoch不宜过多
-            batch_size=32,
-            validation_data=(X_val, y_val),
-            verbose=1,
-            shuffle=False  # 时序数据禁止shuffle
-        )
-
-        # 4. 记录最优模型（保留验证损失最低的）
-        current_val_loss = history.history['val_loss'][-1]
-        print(f"当前窗口验证损失：{current_val_loss:.4f}")
-
-        if current_val_loss < best_val_loss:
-            best_val_loss = current_val_loss
-            best_model_weights = model.get_weights()
-            print(f"📈 更新最优模型（验证损失：{best_val_loss:.4f}）")
-
-    # ========== 保存最优模型 ==========
-    if best_model_weights is None:
-        raise RuntimeError("无有效训练窗口！请检查数据量或窗口参数")
-
-    # 加载最优权重并保存
-    final_model = build_unified_model(seq_length)
-    final_model.set_weights(best_model_weights)
-    final_model.save_weights(model_weights_path)
-
-    # 保存scaler
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
-
-    print(f"\n✅ 滑动窗口训练完成！")
-    print(f"📊 最优验证损失：{best_val_loss:.4f}")
-    print(f"💾 模型保存至：{model_weights_path}")
-    print(f"💾 Scaler保存至：{scaler_path}")
-
-    return final_model, scaler
+    return model, scaler  # 关键：返回model+scaler
 
 
+# 不是主要问题
 def train_lstm_attention_model_local_scaler(preprocessed_df, seq_length=32, save_path='./',
                                             window_ratio=0.1, val_ratio=0.2, step_ratio=0.5):
     """
@@ -591,6 +605,193 @@ def predict_stepped_window_fast(dataB, seq_length=32, model_weights_path='./lstm
     return pred_time, pred_data_inversed
 
 
+# 纯新的，根据训练模型适配的，每次滑动一半窗口且全部输入都是真实数据的方法
+# 初始窗口：读取32 个真实数据 → 预测第 33 个点；
+# 窗口滑动 1 个点：去掉第 1 个真实点，补充1 个预测点 → 用新窗口预测第 34 个点；
+# 重复步骤 2，直到累计预测 16 个点（窗口内包含 16 个真实点 + 16 个预测点）；
+# 窗口重置：滑动 16 个点，重新读取 32 个真实数据 → 开始下一轮 16 个点的预测；
+
+# def predict_with_real_window_reset(
+#         dataB,  # 输入的真实数据（DataFrame，含Voltage列）
+#         seq_length=32,  # 滑动窗口大小（固定32）
+#         save_path='./',  # 模型/scaler保存路径
+#         predict_step_per_round=16,  # 每轮预测16个点（窗口一半）
+#         max_predict_num=None  # 单次最大预测点数，None=全量预测
+# ):
+#     """
+#     最终版预测函数（按你的要求设计）：
+#     1. 每轮初始窗口：32个真实数据 → 预测16个点（逐点滑窗，用预测值补充）
+#     2. 每轮结束后：重置窗口，重新读取32个真实数据 → 避免误差累积
+#     3. 支持最大预测量控制，降低测试代价
+#     """
+#     # ===================== 1. 加载模型和训练时的scaler =====================
+#     model_weights_path = os.path.join(save_path, 'lstm_model_weights.h5')
+#     scaler_path = os.path.join(save_path, 'scaler_piezo.pkl')
+#
+#     # 加载scaler（保证和训练时一致）
+#     with open(scaler_path, 'rb') as f:
+#         scaler = pickle.load(f)
+#     print(f"✅ 加载训练时的scaler：min={scaler.data_min_[0]:.4f}, max={scaler.data_max_[0]:.4f}")
+#
+#     # 加载模型（和训练用同一个结构）
+#     model = build_unified_model(seq_length)
+#     model.load_weights(model_weights_path)
+#     print(f"✅ 加载模型权重：{model_weights_path}")
+#
+#     # ===================== 2. 数据预处理（标准化+维度校验） =====================
+#     # 提取Voltage列并强制二维数组（避免scaler维度错误）
+#     raw_voltage = dataB[['Voltage']].values
+#     if len(raw_voltage.shape) == 1:
+#         raw_voltage = raw_voltage.reshape(-1, 1)
+#
+#     # 标准化（仅transform，用训练时的scaler）
+#     data_scaled = scaler.transform(raw_voltage)
+#     data_length = len(data_scaled)
+#     print(f"✅ 输入数据标准化完成：总长度={data_length}，范围=[{data_scaled.min():.4f}, {data_scaled.max():.4f}]")
+#
+#     # ===================== 3. 核心预测逻辑（逐轮预测+窗口重置） =====================
+#     all_pred_data = []  # 存储所有预测结果（标准化后）
+#     all_pred_time = []  # 存储预测点的时间索引
+#     total_predict_count = 0  # 累计预测点数
+#     current_round_start = 0  # 每轮窗口的起始位置
+#
+#     # 循环预测：直到窗口滑到数据末尾或达到最大预测量
+#     while current_round_start + seq_length <= data_length:
+#         # ------------ 每轮初始：读取32个真实数据作为窗口 ------------
+#         current_window = data_scaled[current_round_start:current_round_start + seq_length, 0].copy()
+#         round_predict_count = 0  # 本轮已预测点数
+#
+#         # ------------ 本轮内逐点预测（共16个点） ------------
+#         while round_predict_count < predict_step_per_round:
+#             # 检查是否超出数据范围
+#             if current_round_start + seq_length + round_predict_count >= data_length:
+#                 break
+#
+#             # 转换为模型输入格式：(1, 32, 1)
+#             input_window = current_window.reshape(1, seq_length, 1)
+#
+#             # 预测1个点
+#             pred_scaled = model.predict(input_window, verbose=0)[0, 0]
+#
+#             # 记录预测结果和时间索引
+#             pred_idx = current_round_start + seq_length + round_predict_count
+#             all_pred_data.append(pred_scaled)
+#             all_pred_time.append(pred_idx)
+#
+#             # ------------ 窗口滑动1个点：补充预测值 ------------
+#             # 去掉窗口第一个点，末尾补充刚预测的点
+#             current_window = np.roll(current_window, -1)  # 窗口左移1位
+#             current_window[-1] = pred_scaled  # 最后一位替换为预测值
+#
+#             # 计数更新
+#             round_predict_count += 1
+#             total_predict_count += 1
+#
+#             # 检查是否达到最大预测量
+#             if max_predict_num is not None and total_predict_count >= max_predict_num:
+#                 break
+#
+#         # ------------ 本轮结束：窗口重置，滑动16个点（读取新的32个真实数据） ------------
+#         current_round_start += predict_step_per_round
+#
+#         # 打印进度
+#         progress = min(total_predict_count / (max_predict_num if max_predict_num else data_length - seq_length) * 100,
+#                        100)
+#         print(f"预测进度：{progress:.1f}% | 累计预测点数：{total_predict_count}", end='\r')
+#
+#         # 达到最大预测量则退出
+#         if max_predict_num is not None and total_predict_count >= max_predict_num:
+#             break
+#
+#     # ===================== 4. 逆标准化（还原为真实电压值） =====================
+#     # 转换为数组并逆标准化
+#     all_pred_data = np.array(all_pred_data).reshape(-1, 1)
+#     pred_data_inversed = scaler.inverse_transform(all_pred_data)
+#     pred_time = np.array(all_pred_time)
+#
+#     # ===================== 5. 结果输出 =====================
+#     print(f"\n\n✅ 预测完成！")
+#     print(f"   - 实际预测点数：{len(pred_data_inversed)}")
+#     print(f"   - 预测值范围：{pred_data_inversed.min():.4f} ~ {pred_data_inversed.max():.4f}")
+#     print(f"   - 真实值范围：{dataB['Voltage'].min():.4f} ~ {dataB['Voltage'].max():.4f}")
+#
+#     return pred_time, pred_data_inversed
+
+
+# 去掉加载pkl测试版
+def predict_with_real_window_reset(
+        dataB,  # 输入的真实数据（DataFrame，含Voltage列）
+        model,  # 训练好的模型（直接传入）
+        scaler,  # 训练时的scaler（直接传入）
+        seq_length=32,  # 滑动窗口大小（固定32）
+        predict_step_per_round=16,  # 每轮预测16个点
+        max_predict_num=None  # 单次最大预测点数
+):
+    """
+    简化版预测函数：不加载scaler.pkl，直接使用训练返回的scaler
+    """
+    print("=" * 50 + " 简化版预测（无scaler.pkl） " + "=" * 50)
+    # ===================== 1. 数据预处理 =====================
+    raw_voltage = dataB[['Voltage']].values.reshape(-1, 1)  # 强制二维
+    print(f"✅ 原始数据范围：{raw_voltage.min():.6f} ~ {raw_voltage.max():.6f}")
+
+    # 标准化（用训练传入的scaler）
+    data_scaled = scaler.transform(raw_voltage)
+    print(f"✅ 标准化后范围：{data_scaled.min():.6f} ~ {data_scaled.max():.6f}")
+    data_length = len(data_scaled)
+
+    # ===================== 2. 核心预测逻辑 =====================
+    all_pred_data = []
+    all_pred_time = []
+    total_predict_count = 0
+    current_round_start = 0
+
+    while current_round_start + seq_length <= data_length:
+        current_window = data_scaled[current_round_start:current_round_start + seq_length, 0].copy()
+        round_predict_count = 0
+
+        while round_predict_count < predict_step_per_round:
+            if current_round_start + seq_length + round_predict_count >= data_length:
+                break
+
+            input_window = current_window.reshape(1, seq_length, 1)
+            pred_scaled = model.predict(input_window, verbose=0)[0, 0]
+
+            # 记录结果
+            pred_idx = current_round_start + seq_length + round_predict_count
+            all_pred_data.append(pred_scaled)
+            all_pred_time.append(pred_idx)
+
+            # 滑窗补充预测值
+            current_window = np.roll(current_window, -1)
+            current_window[-1] = pred_scaled
+
+            round_predict_count += 1
+            total_predict_count += 1
+
+            if max_predict_num and total_predict_count >= max_predict_num:
+                break
+
+        current_round_start += predict_step_per_round
+        progress = min(total_predict_count / (max_predict_num if max_predict_num else data_length - seq_length) * 100,
+                       100)
+        print(f"\r预测进度：{progress:.1f}% | 累计预测点数：{total_predict_count}", end='')
+
+        if max_predict_num and total_predict_count >= max_predict_num:
+            break
+
+    # ===================== 3. 逆标准化 =====================
+    all_pred_data = np.array(all_pred_data).reshape(-1, 1)
+    pred_data_inversed = scaler.inverse_transform(all_pred_data)
+    pred_time = np.array(all_pred_time)
+
+    # ===================== 4. 结果输出 =====================
+    print(f"\n\n✅ 预测完成！")
+    print(f"   - 预测值范围：{pred_data_inversed.min():.6f} ~ {pred_data_inversed.max():.6f}")
+    print(f"   - 真实值范围：{dataB['Voltage'].min():.6f} ~ {dataB['Voltage'].max():.6f}")
+
+    return pred_time, pred_data_inversed
+
 # 核心：复刻旧代码的预测逻辑（自回归+小步预测）
 def predict_old(dataB, seq_length=32, save_path='./', ratio=2):
     """
@@ -658,102 +859,6 @@ def predict_old(dataB, seq_length=32, save_path='./', ratio=2):
     print(f"   - 总预测点数：{len(pred_data_inversed)}")
 
     return pred_time, pred_data_inversed
-
-
-# ========== 适配局部标准化的predict_old函数 ==========
-def predict_old_local_scaler(dataB, seq_length=32, save_path='./', ratio=2):
-    """
-    适配局部窗口标准化的预测函数（自回归+小步预测）
-    :param dataB: 输入数据（DataFrame，含Voltage列）
-    :param seq_length: 窗口大小
-    :param save_path: 模型/scaler保存路径
-    :param ratio: 步长比例（默认2 → future_steps=16）
-    :return: 预测点时间索引、逆标准化后的预测值
-    """
-    # 1. 加载模型和scaler（适配局部标准化的训练函数输出）
-    model_weights_path = os.path.join(save_path, 'lstm_model_weights_local.h5')
-    window_scalers_path = os.path.join(save_path, 'window_scalers.pkl')
-    global_scaler_path = os.path.join(save_path, 'global_scaler_piezo.pkl')
-
-    # 加载模型
-    model = build_unified_model(seq_length)
-    model.load_weights(model_weights_path)
-    print(f"✅ 成功加载模型权重：{model_weights_path}")
-
-    # 加载窗口scaler和全局参考scaler
-    with open(window_scalers_path, 'rb') as f:
-        window_scalers = pickle.load(f)
-    with open(global_scaler_path, 'rb') as f:
-        global_scaler = pickle.load(f)
-    print(f"✅ 加载{len(window_scalers)}个窗口的局部scaler")
-
-    # 2. 80-20划分（用原始数据，不做全局标准化）
-    raw_data = dataB[['Voltage']].values
-    total_samples_raw = len(raw_data) - seq_length
-    split_index = int(total_samples_raw * 0.8)
-    X_test_raw = raw_data[split_index: split_index + total_samples_raw - split_index + seq_length]
-
-    # 3. 旧代码核心：小步预测参数
-    future_steps = seq_length // ratio
-    total_steps = (total_samples_raw - split_index) // future_steps
-    all_pred_data = []
-    pred_time_list = []
-
-    # 4. 自回归预测（核心逻辑，适配局部scaler）
-    for step in range(total_steps):
-        start_index = split_index + step * future_steps
-        if start_index + seq_length > len(raw_data):
-            break
-
-        # 找到当前预测窗口所属的局部scaler
-        # 匹配规则：找到最接近当前start_index的窗口scaler
-        window_starts = sorted(window_scalers.keys())
-        target_window_start = None
-        for ws in window_starts:
-            if ws <= start_index < ws + int(total_samples_raw * 0.1):  # 0.1是训练时的window_ratio
-                target_window_start = ws
-                break
-        # 如果没找到匹配的窗口scaler，用全局scaler兜底
-        if target_window_start is None:
-            target_scaler = global_scaler
-            print(f"⚠️ 预测窗口{start_index}未匹配到局部scaler，使用全局scaler")
-        else:
-            target_scaler = window_scalers[target_window_start]
-            print(f"✅ 预测窗口{start_index}匹配到局部scaler（窗口起始：{target_window_start}）")
-
-        # 取当前窗口的原始数据，做局部标准化
-        current_raw_window = raw_data[start_index: start_index + seq_length]
-        current_scaled_window = target_scaler.transform(current_raw_window)
-        last_sequence = current_scaled_window.reshape(1, seq_length, 1)
-        predicted_data_scaled = []
-
-        # 自回归预测（小步）
-        for i in range(future_steps):
-            pred_scaled = model.predict(last_sequence, verbose=0)[0, 0]
-            predicted_data_scaled.append(pred_scaled)
-            # 滚动窗口：预测值塞回（用标准化后的值）
-            last_sequence = np.roll(last_sequence, -1, axis=1)
-            last_sequence[0, -1, 0] = pred_scaled
-
-        # 逆标准化：用匹配的局部scaler还原幅值
-        predicted_data_scaled = np.array(predicted_data_scaled).reshape(-1, 1)
-        predicted_data_inversed = target_scaler.inverse_transform(predicted_data_scaled)
-        all_pred_data.extend(predicted_data_inversed.flatten().tolist())
-
-        # 记录预测时间索引
-        pred_start = start_index + seq_length
-        pred_time_list.extend(range(pred_start, pred_start + future_steps))
-
-    # 5. 整理输出
-    all_pred_data = np.array(all_pred_data).reshape(-1, 1)
-    pred_time = np.array(pred_time_list[:len(all_pred_data)])  # 对齐长度
-
-    print(f"\n✅ predict_old（局部标准化）预测完成：")
-    print(f"   - 窗口大小：{seq_length} | 单次预测步长：{future_steps}")
-    print(f"   - 预测值范围：{all_pred_data.min():.4f} ~ {all_pred_data.max():.4f}")
-    print(f"   - 总预测点数：{len(all_pred_data)}")
-
-    return pred_time, all_pred_data
 
 
 

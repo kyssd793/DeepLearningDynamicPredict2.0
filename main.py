@@ -37,14 +37,14 @@ if __name__ == "__main__":
     # 1. 读取原始数据
     csv_path = "fix150.csv"
     raw_df = dp.extract_single_column_csv(csv_path)
-    dp.plot_voltage_single_column(raw_df, title_suffix="（原始数据）")
+    # dp.plot_voltage_single_column(raw_df, title_suffix="（原始数据）")
 
 
     # 2. 核心步骤1：定向降采样到2w条（优先执行！）
     target_count = 20000  # 目标2w条
     down_df_2w, down_sr_2w = dp.downsample_to_target_count(raw_df, target_count=target_count)
     print(f"✅ 降采样到2w条完成，采样率：{down_sr_2w} Hz")
-    dp.plot_voltage_single_column(down_df_2w, title_suffix="（定向降采样到2w条后）")
+    # dp.plot_voltage_single_column(down_df_2w, title_suffix="（定向降采样到2w条后）")
 
     # 3. 核心步骤2：用降采样后的数据找10Hz内的真实基频
     real_base_freq = dp.plot_spectrum_base_freq(down_df_2w, down_sr_2w, top_n=3)
@@ -52,7 +52,7 @@ if __name__ == "__main__":
     # 4. 适用于lstm处理的数据
     balanced_df = dp.enhance_lstm_feature_slim(down_df_2w, down_sr_2w, real_base_freq)
     print(f"✅ 预处理完成（2w条数据+异常值清理+平衡版平滑）")
-    dp.plot_voltage_single_column(balanced_df, title_suffix="（2w条数据+异常值清理+平衡版平滑后）")
+    # dp.plot_voltage_single_column(balanced_df, title_suffix="（2w条数据+异常值清理+平衡版平滑后）")
 
     # 5. ===================== 训练模型 =====================
     print("\n===== 开始训练模型 =====")
@@ -60,12 +60,12 @@ if __name__ == "__main__":
     save_path = './'  # 关键：改为当前目录
 
     # 修改调用代码，接收3个返回值
-    model, window_scalers, global_scaler = mtp.train_lstm_attention_model_local_scaler(
+    model, scale = mtp.train_lstm_attention_model_2(
         preprocessed_df=balanced_df,
         seq_length=32,
         save_path=save_path,
     )
-    print(f"✅ 模型训练完成！模型文件：{os.path.join(save_path, 'lstm_attention_piezo_model')}")
+    print(f"✅ 模型训练完成！")
 
     # ===================== 第三步：滑窗预测（单独执行，用同级目录的模型） =====================
     print("\n===== 开始滑窗预测 =====")
@@ -89,11 +89,14 @@ if __name__ == "__main__":
     #     predict_step=32,  # 单次预测32个点（和窗口等长）
     #     target_total_points=1000  # 目标预测2万点
     # )
-    time_pred, pred_data = mtp.predict_old_local_scaler(
+    time_pred, pred_data = mtp.predict_with_real_window_reset(
         dataB=inputData,
+        model=model,
+        scaler=scale,
         seq_length=32,
-        save_path=save_path,
-        ratio=2
+        # save_path='./',
+        predict_step_per_round=16,
+        max_predict_num=1000  # 先小批量测试
     )
     # ===================== 绘图 =====================
     print("\n===== 生成图片和数据 =====")
