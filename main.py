@@ -7,6 +7,8 @@ import model_train_predict as mtp
 import os
 import tensorflow as tf
 
+from data_preprocess import downsample_data
+
 # 1. 强制暴露所有GPU（关键！）
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 # 2. 开启显存动态增长
@@ -32,27 +34,39 @@ else:
     print("⚠️ 未检测到GPU，使用CPU运行")
 
 
-# 主调用逻辑
+# 主调用逻辑（先降采样，再滤波）
 if __name__ == "__main__":
     # 1. 读取原始数据
     csv_path = "fix150.csv"
     raw_df = dp.extract_single_column_csv(csv_path)
-    # dp.plot_voltage_single_column(raw_df, title_suffix="（原始数据）")
+    dp.plot_voltage_single_column(raw_df, title_suffix="（原始数据）")
+    #
+    # # 2. 第一步：先降采样（50kHz→1kHz，降低采样率量级）
+    # down_sample_data, down_sample_sr = dp.downsample_data(raw_df, downsample_factor=50)
+    # dp.plot_voltage_single_column(down_sample_data, title_suffix="先降采样的数据")
+    #
+    # # 3. 第二步：再低通滤波（关键：采样率1kHz，截止频率6Hz）
+    # # 计算归一化频率：6/(0.5×1000)=0.012（在正常范围0.001~0.5内）
+    # lower_passed_data = dp.lowpass_filter(down_sample_data, down_sample_sr, 6)
+    # dp.plot_voltage_single_column(lower_passed_data, title_suffix="先降采样后低通滤波的数据")
+    #
+    # # 打印幅值对比（验证效果）
+    # print(f"原始幅值：{raw_df['Voltage'].max()-raw_df['Voltage'].min()}")
+    # print(f"最终幅值：{lower_passed_data['Voltage'].max()-lower_passed_data['Voltage'].min()}")
 
-
-    # 2. 核心步骤1：定向降采样到2w条（优先执行！）
+    # 2. 核心步骤1：定向降采样到2w条
     target_count = 20000  # 目标2w条
     down_df_2w, down_sr_2w = dp.downsample_to_target_count(raw_df, target_count=target_count)
     print(f"✅ 降采样到2w条完成，采样率：{down_sr_2w} Hz")
-    # dp.plot_voltage_single_column(down_df_2w, title_suffix="（定向降采样到2w条后）")
+    dp.plot_voltage_single_column(down_df_2w, title_suffix="（定向降采样到2w条后）")
 
     # 3. 核心步骤2：用降采样后的数据找10Hz内的真实基频
     real_base_freq = dp.plot_spectrum_base_freq(down_df_2w, down_sr_2w, top_n=3)
 
     # 4. 适用于lstm处理的数据
-    balanced_df = dp.enhance_lstm_feature_slim(down_df_2w, down_sr_2w, real_base_freq)
+    balanced_df = dp.enhance_lstm_feature(down_df_2w, down_sr_2w, real_base_freq)
     print(f"✅ 预处理完成（2w条数据+异常值清理+平衡版平滑）")
-    # dp.plot_voltage_single_column(balanced_df, title_suffix="（2w条数据+异常值清理+平衡版平滑后）")
+    dp.plot_voltage_single_column(balanced_df, title_suffix="（2w条数据+异常值清理+平衡版平滑后）")
 
     # 5. ===================== 训练模型 =====================
     print("\n===== 开始训练模型 =====")
@@ -96,7 +110,7 @@ if __name__ == "__main__":
         seq_length=32,
         # save_path='./',
         predict_step_per_round=16,
-        max_predict_num=1000  # 先小批量测试
+        max_predict_num=20000  # 先小批量测试
     )
     # ===================== 绘图 =====================
     print("\n===== 生成图片和数据 =====")
@@ -105,26 +119,26 @@ if __name__ == "__main__":
     # 修复2：确保time_true和time_pred维度匹配
     time_true = np.arange(len(inputData))
 
-    # =====================只会绘图不看 =====================
+    # =====================只会绘图不存 =====================
     print("\n===== 绘制真实/预测对比图 =====")
     mtp.plot_double_figure(
-        true_data=inputData,       # 真实数据（balanced_df）
+        true_data=down_df_2w,       # 真实数据（balanced_df）
         time_true=time_true,       # 真实数据的采样点序号
         pred_data=pred_data_flat,  # 展平后的预测数据
         time_pred=time_pred        # 预测数据的采样点序号
     )
 
-    # mtp.save_prediction_to_csv(pred_data_flat, filename='prediction_result_fix15_0107.csv')
-    # mtp.save_comparison_plot(
-    #     true_data=inputData,
-    #     pred_data=pred_data_flat,
-    #     time_true=time_true,
-    #     time_pred=time_pred,
-    #     filename='prediction_comparison_0107.png'
-    # )
-    # print("\n===== 执行完成！生成的文件： =====")
-    # print(f"1. 预测数据CSV：{os.path.abspath('prediction_result_fix15_0107.csv')}")
-    # print(f"2. 对比图PNG：{os.path.abspath('prediction_comparison_0107.png')}")
+    mtp.save_prediction_to_csv(pred_data_flat, filename='prediction_result_fix15_0112.csv')
+    mtp.save_comparison_plot(
+        true_data=inputData,
+        pred_data=pred_data_flat,
+        time_true=time_true,
+        time_pred=time_pred,
+        filename='prediction_comparison_0112.png'
+    )
+    print("\n===== 执行完成！生成的文件： =====")
+    print(f"1. 预测数据CSV：{os.path.abspath('prediction_result_fix15_0112.csv')}")
+    print(f"2. 对比图PNG：{os.path.abspath('prediction_comparison_0112.png')}")
 
     # ===================== 第四步：保存预测结果（同级目录，无绘图） =====================
     # print("\n===== 保存预测结果 =====")

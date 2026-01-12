@@ -36,7 +36,26 @@ def extract_single_column_csv(file_path):
     return df
 
 
-def downsample_data(data_df, downsample_factor=10):
+# 最普通的采样方式，平均取一个点
+def downsample_data(data_df, downsample_factor=50):
+    """
+    示波器式抽取降采样：每n个连续点取第1个点，和示波器降采样逻辑一致
+    :param data_df: 原始Voltage的DataFrame
+    :param downsample_factor: 降采样因子（默认10，50kHz→5kHz）
+    :return: 降采样后的DataFrame、降采样后采样率
+    """
+    # 原始采样率（根据你的场景：100万条/20秒=50kHz）
+    original_sr = 50000
+    voltage_array = data_df['Voltage'].values
+    align_length = len(voltage_array) - (len(voltage_array) % downsample_factor)
+    voltage_aligned = voltage_array[:align_length]
+    voltage_downsampled = voltage_aligned[::downsample_factor]  # 步长取数，最简洁的抽取逻辑
+    down_df = pd.DataFrame({'Voltage': voltage_downsampled})
+    down_sr = original_sr / downsample_factor
+    return down_df, down_sr
+
+
+def average_downsample_data(data_df, downsample_factor=10):
     """
     均值降采样：把n个连续点的均值作为新点，减少数据量
     :param data_df: 原始Voltage的DataFrame
@@ -142,23 +161,23 @@ def plot_spectrum(data_df, sr, top_n=3):
     print(f"检测到的核心频率（按能量排序）：{top_freqs} Hz")
     return top_freqs[0]  # 返回能量最高的频率（压电片主频率）
 
+
+# 低通滤波，只是简单方法放到这里
 def lowpass_filter(data_df, sr, cutoff_freq):
     """
     巴特沃斯低通滤波：保留低频信号，滤除高频噪声
-    :param data_df: 降采样后的DataFrame
-    :param sr: 降采样后的采样率
-    :param cutoff_freq: 截止频率（设为2×核心频率）
+    :param data_df: 待滤波的DataFrame（原始/降采样后都可）
+    :param sr: 传入data_df对应数据的实际采样率（关键！原始数据传50000，降采样后传1000）
+    :param cutoff_freq: 截止频率（设为2×核心频率，比如3Hz→6Hz）
     :return: 滤波后的DataFrame
     """
-    # 提取电压数组
     voltage = data_df['Voltage'].values
-    # 设计巴特沃斯低通滤波器（4阶，平衡滤波效果和波形失真）
-    nyq = 0.5 * sr  # 奈奎斯特频率
+    nyq = 0.5 * sr
     normal_cutoff = cutoff_freq / nyq
-    b, a = butter(2, normal_cutoff, btype='low', analog=False) # 二阶滤波器
-    # 零相位滤波（filtfilt）：避免波形偏移，适合非实时场景
+    # 验证：打印归一化截止频率（必须在0.001~0.5之间，否则滤波无效）
+    print(f"归一化截止频率：{normal_cutoff}（正常范围0.001~0.5）")
+    b, a = butter(2, normal_cutoff, btype='low', analog=False)
     filtered_voltage = filtfilt(b, a, voltage)
-    # 转成DataFrame
     filtered_df = pd.DataFrame({'Voltage': filtered_voltage})
     return filtered_df
 
@@ -430,7 +449,7 @@ def wavelet_denoise_pulse_preserve(data_df, wavelet='db4', level=3):
     enhanced_df = pd.DataFrame({'Voltage': denoised_voltage})
     return enhanced_df
 
-
+# 会极致保留特征，并且增强对抗衰减，形成连续的曲线。
 def enhance_lstm_feature(data_df, down_sr, base_freq=2):
     """
     强化LSTM可识别的规律：保留基频趋势 + 增强关键尖峰
@@ -515,12 +534,12 @@ def enhance_lstm_feature_slim(data_df, down_sr, base_freq):
     nyq = 0.5 * down_sr
     low = (base_freq - 2) / nyq
     high = (base_freq + 2) / nyq
-    b, a = butter(2, [low, high], btype='band')
+    b, a = butter(1, [low, high], btype='band')
     # 用“镜像延拓”处理信号边缘，消除滤波的开头/结尾波动
     filtered_voltage = filtfilt(b, a, voltage, padtype='odd', padlen=len(voltage)//10)
 
     # ========== 步骤2：原始信号与滤波信号融合（0.8:0.2） ==========
-    fused_voltage = voltage * 0.2 + filtered_voltage * 0.8 # 这个比例很重要，后者越大特征越明显
+    fused_voltage = voltage * 0.0 + filtered_voltage * 1.0 # 这个比例很重要，后者越大特征越明显
 
     # ========== 步骤3：分层校准（先均值，再边缘） ==========
     # 1. 全局均值校准

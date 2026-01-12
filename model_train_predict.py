@@ -279,6 +279,7 @@ def train_lstm_attention_model_2(preprocessed_df, seq_length=32, save_path='./',
         # 注意：加载模型时无法恢复scaler，因此如果是加载已有模型，需要重新fit scaler
         scaler = MinMaxScaler()
         scaler.fit(preprocessed_df[['Voltage']])  # 重新用当前数据fit scaler
+        # print("训练scaler范围:", scaler.data_min_, scaler.data_max_)
     else:
         # ========== 重新训练 ==========
         print("⚠️ 未检测到已有模型，开始滑动窗口训练...")
@@ -724,7 +725,7 @@ def predict_with_real_window_reset(
         model,  # 训练好的模型（直接传入）
         scaler,  # 训练时的scaler（直接传入）
         seq_length=32,  # 滑动窗口大小（固定32）
-        predict_step_per_round=16,  # 每轮预测16个点
+        predict_step_per_round=8,  # 每轮预测16个点
         max_predict_num=None  # 单次最大预测点数
 ):
     """
@@ -779,7 +780,7 @@ def predict_with_real_window_reset(
 
         if max_predict_num and total_predict_count >= max_predict_num:
             break
-
+    # print("训练scaler范围:", scaler.data_min_, scaler.data_max_)
     # ===================== 3. 逆标准化 =====================
     all_pred_data = np.array(all_pred_data).reshape(-1, 1)
     pred_data_inversed = scaler.inverse_transform(all_pred_data)
