@@ -40,19 +40,6 @@ if __name__ == "__main__":
     csv_path = "fix150.csv"
     raw_df = dp.extract_single_column_csv(csv_path)
     dp.plot_voltage_single_column(raw_df, title_suffix="（原始数据）")
-    #
-    # # 2. 第一步：先降采样（50kHz→1kHz，降低采样率量级）
-    # down_sample_data, down_sample_sr = dp.downsample_data(raw_df, downsample_factor=50)
-    # dp.plot_voltage_single_column(down_sample_data, title_suffix="先降采样的数据")
-    #
-    # # 3. 第二步：再低通滤波（关键：采样率1kHz，截止频率6Hz）
-    # # 计算归一化频率：6/(0.5×1000)=0.012（在正常范围0.001~0.5内）
-    # lower_passed_data = dp.lowpass_filter(down_sample_data, down_sample_sr, 6)
-    # dp.plot_voltage_single_column(lower_passed_data, title_suffix="先降采样后低通滤波的数据")
-    #
-    # # 打印幅值对比（验证效果）
-    # print(f"原始幅值：{raw_df['Voltage'].max()-raw_df['Voltage'].min()}")
-    # print(f"最终幅值：{lower_passed_data['Voltage'].max()-lower_passed_data['Voltage'].min()}")
 
     # 2. 核心步骤1：定向降采样到2w条
     target_count = 20000  # 目标2w条
@@ -67,13 +54,13 @@ if __name__ == "__main__":
     balanced_df = dp.enhance_lstm_feature(down_df_2w, down_sr_2w, real_base_freq)
     print(f"✅ 预处理完成（2w条数据+异常值清理+平衡版平滑）")
     dp.plot_voltage_single_column(balanced_df, title_suffix="（2w条数据+异常值清理+平衡版平滑后）")
+    # mtp.save_one_column_to_csv(balanced_df,filename="processed_data_fix15.csv")
+
 
     # 5. ===================== 训练模型 =====================
     print("\n===== 开始训练模型 =====")
     # 模型/scaler保存到当前同级目录（无需创建子文件夹）
     save_path = './'  # 关键：改为当前目录
-
-    # 修改调用代码，接收3个返回值
     model, scale = mtp.train_lstm_attention_model_2(
         preprocessed_df=balanced_df,
         seq_length=32,
@@ -81,28 +68,10 @@ if __name__ == "__main__":
     )
     print(f"✅ 模型训练完成！")
 
-    # ===================== 第三步：滑窗预测（单独执行，用同级目录的模型） =====================
+    # 6. ===================== 滑窗预测 =====================
     print("\n===== 开始滑窗预测 =====")
-    # 预测数据用预处理后的balanced_df（也可替换为新测试数据）
+    # 预测数据用预处理后的balanced_df
     inputData = balanced_df.copy()
-
-    # # 调用适配后的预测函数（无Time(s)列，采样点序号为时间轴）
-    # time_pred, pred_data = mtp.predict_with_sliding_window_fixed(
-    #     dataB=dataB,
-    #     seq_length=32,
-    #     model_path='./lstm_attention_piezo_model',  # 同级目录的模型
-    #     scaler_path='./scaler_piezo.pkl',  # 同级目录的scaler
-    #     future_steps=16,  # 单次预测16点（你的核心逻辑）
-    # )
-    # 在main.py的预测阶段替换为：
-    # time_pred, pred_data = mtp.predict_stepped_window_fast(
-    #     dataB=inputData,
-    #     seq_length=32,  # 输入窗口32个点
-    #     model_weights_path='./lstm_model_weights.h5',
-    #     scaler_path='./scaler_piezo.pkl',
-    #     predict_step=32,  # 单次预测32个点（和窗口等长）
-    #     target_total_points=1000  # 目标预测2万点
-    # )
     time_pred, pred_data = mtp.predict_with_real_window_reset(
         dataB=inputData,
         model=model,
@@ -110,35 +79,43 @@ if __name__ == "__main__":
         seq_length=32,
         # save_path='./',
         predict_step_per_round=16,
-        max_predict_num=20000  # 先小批量测试
+        max_predict_num=20000
     )
-    # ===================== 绘图 =====================
+    ## ===================== 绘图 =====================
     print("\n===== 生成图片和数据 =====")
     # 修复1：展平pred_data为一维数组（避免维度不匹配）
     pred_data_flat = pred_data.flatten()
+
+    # 新增：填充前32个0，使长度与原始2w条一致
+    seq_length = 32  # 滑动窗口大小
+    pred_data_padded = mtp.pad_pred_data(pred_data_flat, seq_length)
+
     # 修复2：确保time_true和time_pred维度匹配
     time_true = np.arange(len(inputData))
+    time_pred = np.arange(len(pred_data_padded))  # 填充后预测数据的时间轴
 
     # =====================只会绘图不存 =====================
     print("\n===== 绘制真实/预测对比图 =====")
     mtp.plot_double_figure(
         true_data=down_df_2w,       # 真实数据（balanced_df）
         time_true=time_true,       # 真实数据的采样点序号
-        pred_data=pred_data_flat,  # 展平后的预测数据
+        pred_data=pred_data_padded,  # 展平后的预测数据
         time_pred=time_pred        # 预测数据的采样点序号
     )
 
-    mtp.save_prediction_to_csv(pred_data_flat, filename='prediction_result_fix15_0112.csv')
+    ## 存储为.csv文件
+    mtp.save_one_column_to_csv(pred_data_padded, filename='prediction_result_fix15_0113.csv')
+    ## 存储png图像
     mtp.save_comparison_plot(
         true_data=inputData,
-        pred_data=pred_data_flat,
+        pred_data=pred_data_padded,
         time_true=time_true,
         time_pred=time_pred,
-        filename='prediction_comparison_0112.png'
+        filename='prediction_comparison_0113.png'
     )
     print("\n===== 执行完成！生成的文件： =====")
-    print(f"1. 预测数据CSV：{os.path.abspath('prediction_result_fix15_0112.csv')}")
-    print(f"2. 对比图PNG：{os.path.abspath('prediction_comparison_0112.png')}")
+    print(f"1. 预测数据CSV：{os.path.abspath('prediction_result_fix15_0113.csv')}")
+    print(f"2. 对比图PNG：{os.path.abspath('prediction_comparison_0113.png')}")
 
     # ===================== 第四步：保存预测结果（同级目录，无绘图） =====================
     # print("\n===== 保存预测结果 =====")

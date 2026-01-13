@@ -11,7 +11,7 @@ from tensorflow.keras.models import Model
 import tensorflow as tf
 import pickle
 
-
+# 保存为带时间的双列
 def save_to_csv(time_data, predicted_data_inversed, filename):
     # 如果是二维数组或其他类型，可以展平为一维数组
     time_data = time_data.flatten() if hasattr(time_data, 'flatten') else time_data
@@ -55,17 +55,36 @@ def save_comparison_plot(true_data, pred_data, time_true, time_pred,
     print(f"✅ 对比图已保存为PNG：{os.path.abspath(filename)}")
     return os.path.abspath(filename)
 
-def save_prediction_to_csv(pred_data, filename='prediction_result.csv'):
-    # 展平数据为一维，确保单列
-    pred_data_flat = pred_data.flatten()
-    # 创建单列DataFrame
-    df = pd.DataFrame({
-        'Predicted_Voltage': pred_data_flat
-    })
-    # 保存CSV（无索引，仅数据）
+
+# 只保存为单列,兼容类型
+def save_one_column_to_csv(pred_data, filename='prediction_result.csv'):
+    """
+    保存单列数据到CSV（兼容DataFrame/数组输入）
+    :param pred_data: 输入数据（DataFrame/一维数组/二维数组）
+    :param filename: 保存的文件名
+    :return: 保存文件的绝对路径
+    """
+    # 步骤1：判断输入类型，提取数值数组
+    if isinstance(pred_data, pd.DataFrame):
+        # 如果是DataFrame，提取Voltage列的数值（核心修正）
+        pred_data_array = pred_data['Voltage'].values  # 转为numpy数组
+    elif isinstance(pred_data, np.ndarray):
+        # 如果是numpy数组，直接使用
+        pred_data_array = pred_data
+    else:
+        # 其他类型（如列表），转为数组
+        pred_data_array = np.array(pred_data)
+
+    # 步骤2：展平为一维数组（确保单列）
+    pred_data_flat = pred_data_array.flatten()
+
+    # 步骤3：创建单列DataFrame并保存（无表头、无索引）
+    df = pd.DataFrame(pred_data_flat)  # 直接用一维数组创建，无列名
     df.to_csv(filename, index=False, header=False)
-    print(f"✅ 预测数据已保存为CSV：{os.path.abspath(filename)}")
-    return os.path.abspath(filename)
+
+    abs_path = os.path.abspath(filename)
+    print(f"✅ 预测数据已保存为CSV：{abs_path}")
+    return abs_path
 
 def ensemble_loss(y_true, y_pred, a=0.3, b=0.7):
     # 自定义集成损失函数
@@ -896,3 +915,16 @@ def plot_double_figure(true_data, time_true, pred_data, time_pred):
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()
+
+def pad_pred_data(pred_data_flat, seq_length):
+    """
+    给预测数据前填充seq_length个0，使长度与原始数据一致
+    :param pred_data_flat: 原始预测数据（一维数组）
+    :param seq_length: 滑动窗口大小（如32）
+    :return: 填充后的预测数据（长度=原始数据长度）
+    """
+    # 前填充seq_length个0
+    padded_pred = np.concatenate([np.zeros(seq_length), pred_data_flat])
+    # 确保最终长度和原始2w条一致（防止预测数据过长）
+    padded_pred = padded_pred[:20000]
+    return padded_pred
