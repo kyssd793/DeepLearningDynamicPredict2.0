@@ -2,10 +2,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
-from scipy.signal import welch, find_peaks
-from scipy.signal import butter, filtfilt  # 滤波器设计+零相位滤波
 import pywt # 小波变换库
-from scipy.signal import welch, find_peaks, butter, filtfilt, hilbert  # 新增hilbert
+from scipy.ndimage import gaussian_filter1d
+from scipy.signal import welch, find_peaks, butter, filtfilt, hilbert, medfilt, savgol_filter  # 新增hilbert
 from scipy import signal  # 显式导入scipy.signal，避免兼容问题
 
 # 新增：全局字体配置，解决符号显示问题
@@ -356,98 +355,6 @@ def downsample_data_linear(data_df, downsample_factor=5):
     down_sr = original_sr / downsample_factor
     return down_df, down_sr
 
-def wavelet_denoise(data_df, wavelet='db4', level=3):
-    """
-    小波阈值降噪：保留低频基频+高频脉冲尖峰
-    - wavelet：db4小波（适配脉冲信号）
-    - level：分解层数（3层足够保留2Hz基频）
-    """
-    voltage = data_df['Voltage'].values
-    # 小波分解
-    coeffs = pywt.wavedec(voltage, wavelet, level=level)
-    # 对高频细节系数做阈值处理（保留尖峰，滤除噪声）
-    sigma = np.median(np.abs(coeffs[-1])) / 0.6745  # 噪声标准差估计
-    threshold = sigma * np.sqrt(2 * np.log(len(voltage)))  # 通用阈值
-    # 仅对高频系数阈值处理，保留低频近似系数
-    coeffs_denoised = coeffs.copy()
-    for i in range(1, len(coeffs)):
-        coeffs_denoised[i] = pywt.threshold(coeffs[i], threshold, mode='soft')
-    # 小波重构
-    denoised_voltage = pywt.waverec(coeffs_denoised, wavelet)
-    # 对齐长度（小波重构可能差1个点）
-    denoised_voltage = denoised_voltage[:len(voltage)]
-    denoised_df = pd.DataFrame({'Voltage': denoised_voltage})
-    return denoised_df
-
-
-def wavelet_denoise_with_envelope_fix(data_df, wavelet='db4', level=3, down_sr=None):
-    """
-    适配正负对称脉冲信号的修复版：保留正负波动+修复幅值+匹配实际采样率
-    :param down_sr: 传入降采样后的实际采样率（必须，避免硬编码）
-    """
-    voltage = data_df['Voltage'].values
-    original_max_amp = np.max(np.abs(voltage))  # 保留原始最大幅值
-    original_sign = np.sign(voltage)  # 记录原始信号的正负符号（核心：保留对称性）
-
-    # ========== 步骤1：小波降噪（保留正负尖峰） ==========
-    coeffs = pywt.wavedec(voltage, wavelet, level=level)
-    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-    threshold = sigma * np.sqrt(2 * np.log(len(voltage)))
-    coeffs_denoised = coeffs.copy()
-    for i in range(1, len(coeffs)):
-        coeffs_denoised[i] = pywt.threshold(coeffs[i], threshold, mode='soft')
-    denoised_voltage = pywt.waverec(coeffs_denoised, wavelet)
-    denoised_voltage = denoised_voltage[:len(voltage)]  # 对齐长度
-
-    # ========== 步骤2：希尔伯特包络（保留正负符号） ==========
-    analytic_signal = signal.hilbert(denoised_voltage)
-    envelope = np.abs(analytic_signal) * original_sign  # 用原始符号还原正负（核心修复）
-
-    # 步骤3：低通滤波（匹配实际采样率，不再硬编码）
-    if down_sr is None:
-        raise ValueError("必须传入降采样后的实际采样率down_sr！")
-    nyq = 0.5 * down_sr
-    cutoff = 3  # 保持3Hz基频，但基于实际采样率计算
-    b, a = butter(2, cutoff / nyq, btype='low')
-    smooth_envelope = filtfilt(b, a, envelope)  # 此时包络是带正负的
-
-    # ========== 步骤4：合并信号（保留正负，弱化包络权重） ==========
-    # 归一化（保留正负）
-    envelope_norm = smooth_envelope / np.max(np.abs(smooth_envelope))
-    denoised_norm = denoised_voltage / np.max(np.abs(denoised_voltage))
-    # 调整权重：降噪信号占70%（保留原始波动），包络占30%（仅平滑趋势）
-    enhanced_voltage = (denoised_norm * 0.7) + (envelope_norm * 0.3)
-    # 还原原始幅值
-    enhanced_voltage = enhanced_voltage * original_max_amp
-
-    enhanced_df = pd.DataFrame({'Voltage': enhanced_voltage})
-    return enhanced_df
-
-def wavelet_denoise_pulse_preserve(data_df, wavelet='db4', level=3):
-    """
-    适配脉冲信号的轻量级降噪：只去噪声，完全保留尖峰幅值和正负.去掉了希尔伯特包络和权重合并，避免平滑过度
-    """
-    voltage = data_df['Voltage'].values
-    original_max_amp = np.max(np.abs(voltage))  # 记录原始最大幅值（核心：后续还原）
-
-    # ========== 步骤1：小波降噪（仅过滤高频噪声，保留尖峰） ==========
-    coeffs = pywt.wavedec(voltage, wavelet, level=level)
-    # 调整阈值：只过滤“极高频的小噪声”，保留尖峰（阈值×0.5，更宽松）
-    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-    threshold = sigma * np.sqrt(2 * np.log(len(voltage))) * 0.5  # 阈值缩小，少过滤
-    coeffs_denoised = coeffs.copy()
-    # 只对最顶层的高频系数做阈值（更轻量的降噪）
-    coeffs_denoised[-1] = pywt.threshold(coeffs[-1], threshold, mode='soft')
-    # 其他层系数不处理，完全保留尖峰
-    denoised_voltage = pywt.waverec(coeffs_denoised, wavelet)
-    denoised_voltage = denoised_voltage[:len(voltage)]  # 对齐长度
-
-    # ========== 步骤2：强制还原原始幅值（核心：保留尖峰强度） ==========
-    # 用原始最大幅值重新缩放，确保尖峰强度不变
-    denoised_voltage = denoised_voltage * (original_max_amp / np.max(np.abs(denoised_voltage)))
-
-    enhanced_df = pd.DataFrame({'Voltage': denoised_voltage})
-    return enhanced_df
 
 # 会极致保留特征，并且增强对抗衰减，形成连续的曲线。
 def enhance_lstm_feature(data_df, down_sr, base_freq=2):
@@ -557,122 +464,6 @@ def enhance_lstm_feature_slim(data_df, down_sr, base_freq):
 
     return pd.DataFrame({'Voltage': enhanced_voltage})
 
-def adaptive_feature_enhancement(data_df, down_sr, top_n=1): # 表现尚可，差异很小和之前
-    """
-    学术化特征强化：自适应提取主导基频 + 保留尖峰 + 抑制噪声（无提前归一化）
-    :param down_sr: 降采样后采样率
-    :param top_n: 提取前N个主导基频
-    """
-    voltage = data_df['Voltage'].values
-    original_max_amp = np.max(np.abs(voltage))  # 保留原始幅值基准
-
-    # ========== 步骤1：自适应提取主导基频（学术化：功率谱密度+峰值检测） ==========
-    # 计算功率谱密度，定位主导频率
-    f, Pxx = signal.welch(voltage, fs=down_sr, nperseg=min(1024, len(voltage)//5))
-    # 检测能量前top_n的基频
-    peaks, _ = signal.find_peaks(Pxx, height=np.max(Pxx)*0.3)  # 阈值：能量≥30%最大值
-    top_freqs = f[peaks[np.argsort(Pxx[peaks])[::-1][:top_n]]]  # 按能量排序取前N个
-    if len(top_freqs) == 0:
-        top_freqs = [2]  # 兜底基频
-    base_freq = top_freqs[0]
-    print(f"✅ 自适应提取主导基频：{base_freq:.2f} Hz")
-
-    # ========== 步骤2：带通滤波（聚焦基频±1Hz，学术化描述：“基频带通滤波”） ==========
-    nyq = 0.5 * down_sr
-    low = (base_freq - 1) / nyq
-    high = (base_freq + 1) / nyq
-    b, a = signal.butter(3, [low, high], btype='band', analog=False)  # 3阶滤波器（更平滑）
-    filtered_voltage = signal.filtfilt(b, a, voltage)  # 零相位滤波，无信号偏移
-
-    # ========== 步骤3：尖峰特征增强（学术化：“残差叠加法”保留原始尖峰） ==========
-    # 计算滤波残差（原始信号 - 滤波信号）：保留原始尖峰
-    residual = voltage - filtered_voltage
-    # 残差加权叠加（强化尖峰，保留趋势）
-    enhanced_voltage = filtered_voltage + residual * 0.8  # 残差权重0.8，平衡趋势与尖峰
-
-    # ========== 步骤4：幅值校准（恢复原始信号的幅值范围） ==========
-    enhanced_voltage = enhanced_voltage * (original_max_amp / np.max(np.abs(enhanced_voltage)))
-
-    return pd.DataFrame({'Voltage': enhanced_voltage}), base_freq
-
-
-
-
-def envelope_dominated_smooth(data_df, wavelet='db4', level=3):
-    """
-    包络主导的平滑处理：
-    1. 还原原始幅值；
-    2. 强化低频包络，弱化突变尖峰，呈现类似正弦的渐变规律。
-    """
-    voltage = data_df['Voltage'].values
-    original_max_amp = np.max(np.abs(voltage))  # 记录原始幅值最大值，用于还原
-
-    # ========== 步骤1：小波降噪（弱化尖峰，保留趋势） ==========
-    coeffs = pywt.wavedec(voltage, wavelet, level=level)
-    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-    threshold = sigma * np.sqrt(2 * np.log(len(voltage)))
-    # 关键：增大高频系数的阈值，进一步弱化突变尖峰
-    for i in range(1, len(coeffs)):
-        coeffs[i] = pywt.threshold(coeffs[i], threshold * 2, mode='soft')
-    denoised_voltage = pywt.waverec(coeffs, wavelet)
-    denoised_voltage = denoised_voltage[:len(voltage)]  # 对齐长度
-
-    # ========== 步骤2：提取低频包络并主导波形 ==========
-    analytic_signal = signal.hilbert(denoised_voltage)
-    envelope = np.abs(analytic_signal)
-    # 包络线低通滤波（截止频率设为2Hz，完全贴合基频）
-    down_sr = 10000
-    nyq = 0.5 * down_sr
-    cutoff = 2  # 与基频一致，让包络更接近正弦
-    b, a = butter(2, cutoff / nyq, btype='low')
-    smooth_envelope = filtfilt(b, a, envelope)
-
-    # ========== 步骤3：包络主导波形（弱化尖峰，还原幅值） ==========
-    # 用包络线作为“主体趋势”，叠加少量降噪信号的波动（弱化突变）
-    # 核心：包络占80%权重，降噪信号占20%权重
-    enhanced_voltage = (smooth_envelope * 0.8) + (denoised_voltage * 0.2)
-    # 还原原始幅值量级
-    enhanced_voltage = enhanced_voltage * (original_max_amp / np.max(np.abs(enhanced_voltage)))
-
-    enhanced_df = pd.DataFrame({'Voltage': enhanced_voltage})
-    return enhanced_df
-
-
-def balanced_smooth_with_spike(data_df, wavelet='db4', level=3):
-    """
-    平衡版：保留部分尖峰+平滑渐变+还原幅值
-    """
-    voltage = data_df['Voltage'].values
-    original_max_amp = np.max(np.abs(voltage))  # 强制还原原始幅值
-
-    # ========== 步骤1：小波降噪（保留部分尖峰，弱化过度突变） ==========
-    coeffs = pywt.wavedec(voltage, wavelet, level=level)
-    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-    threshold = sigma * np.sqrt(2 * np.log(len(voltage)))
-    # 调整阈值：保留50%的尖峰能量，弱化过度突变
-    for i in range(1, len(coeffs)):
-        coeffs[i] = pywt.threshold(coeffs[i], threshold * 1.2, mode='soft')
-    denoised_voltage = pywt.waverec(coeffs, wavelet)
-    denoised_voltage = denoised_voltage[:len(voltage)]  # 对齐长度
-
-    # ========== 步骤2：提取包络线（平滑渐变，保留基频） ==========
-    analytic_signal = signal.hilbert(denoised_voltage)
-    envelope = np.abs(analytic_signal)
-    down_sr = 10000
-    nyq = 0.5 * down_sr
-    cutoff = 2.5  # 略高于基频，保留少量波动
-    b, a = butter(2, cutoff / nyq, btype='low')
-    smooth_envelope = filtfilt(b, a, envelope)
-
-    # ========== 步骤3：平衡合并（尖峰占40%，包络占60%） ==========
-    # 核心：既保留部分尖峰，又让包络主导渐变
-    enhanced_voltage = (denoised_voltage * 0.4) + (smooth_envelope * 0.6)
-    # 强制还原原始幅值
-    enhanced_voltage = enhanced_voltage * (original_max_amp / np.max(np.abs(enhanced_voltage)))
-
-    enhanced_df = pd.DataFrame({'Voltage': enhanced_voltage})
-    return enhanced_df
-
 
 def downsample_to_target_count(data_df, target_count=20000, preserve_peak=True):
     """
@@ -706,3 +497,258 @@ def downsample_to_target_count(data_df, target_count=20000, preserve_peak=True):
     print(f"✅ 降采样完成：原始{original_count}条 → 最终{len(final_df)}条（目标{target_count}条）")
 
     return final_df, down_sr
+
+
+def remove_dc_offset_and_outliers(data_df, sigma=3):
+    """去除直流偏移 + 裁剪极端异常值（3σ原则）"""
+    voltage = data_df['Voltage'].values
+
+    # 步骤1：去除直流偏移
+    dc_offset = np.mean(voltage)
+    voltage_no_dc = voltage - dc_offset
+
+    # 步骤2：裁剪极端异常值（只保留均值±3σ范围内的数据）
+    mean = np.mean(voltage_no_dc)
+    std = np.std(voltage_no_dc)
+    lower_bound = mean - sigma * std
+    upper_bound = mean + sigma * std
+    # 超出范围的异常值，用边界值替代（避免信号断裂）
+    voltage_clean = np.clip(voltage_no_dc, lower_bound, upper_bound)
+
+    return pd.DataFrame({'Voltage': voltage_clean})
+
+
+# 原来的方法保留，峰值未美化比较胖
+def extract_smooth_trend_envelope_final(data_df, low_cutoff=5, down_sr=1000, denoise_win=5, smooth_win=501,
+                                        peak_gain=1.5):
+    # 新增：先去除直流偏移+极端异常值（针对你标注的红色尖峰）
+    data_df_clean = remove_dc_offset_and_outliers(data_df)
+    voltage = data_df_clean['Voltage'].values
+
+    # 步骤1：低通滤波（去掉高频密集波动）
+    nyq = 0.5 * down_sr
+    low = low_cutoff / nyq
+    b, a = butter(4, low, btype='low')
+    lowpass_voltage = filtfilt(b, a, voltage)
+
+    # 步骤2：中值滤波（去掉小毛刺）
+    denoised_voltage = medfilt(lowpass_voltage, kernel_size=denoise_win)
+
+    # 步骤3：正负双包络
+    positive_mask = denoised_voltage >= 0
+    positive_envelope = np.zeros_like(denoised_voltage)
+    positive_envelope[positive_mask] = denoised_voltage[positive_mask]
+
+    negative_mask = denoised_voltage < 0
+    negative_envelope = np.zeros_like(denoised_voltage)
+    negative_envelope[negative_mask] = -denoised_voltage[negative_mask]
+
+    # 步骤4：大窗口平滑
+    smooth_positive = savgol_filter(positive_envelope, window_length=smooth_win, polyorder=2)
+    smooth_negative = savgol_filter(negative_envelope, window_length=smooth_win, polyorder=2)
+
+    # 步骤5：尖峰增强
+    pos_peak_mask = smooth_positive > np.max(smooth_positive) * 0.8
+    smooth_positive = np.where(pos_peak_mask, smooth_positive * peak_gain, smooth_positive)
+
+    neg_peak_mask = smooth_negative > np.max(smooth_negative) * 0.8
+    smooth_negative = np.where(neg_peak_mask, smooth_negative * peak_gain, smooth_negative)
+
+    # 步骤6：合并+符号还原
+    enhanced_voltage = np.where(positive_mask, smooth_positive, -smooth_negative)
+
+    # 步骤7：幅值校准
+    original_max_amp = np.max(np.abs(data_df['Voltage'].values))
+    enhanced_max_amp = np.max(np.abs(enhanced_voltage))
+    if enhanced_max_amp > 0:
+        enhanced_voltage = enhanced_voltage * (original_max_amp / enhanced_max_amp)
+
+    return pd.DataFrame({'Voltage': enhanced_voltage})
+
+
+# 高斯美化的方法。原方法在上面做保留，峰值比较胖.但是一旦换了数据d15-20则稍微糟糕一点。
+def hilbert_envelope_extraction(data_df, low_cutoff=10, down_sr=1000, denoise_win=5, gauss_sigma=50, peak_gain=1.2):
+    # 1. 去直流偏移+异常值
+    data_df_clean = remove_dc_offset_and_outliers(data_df)
+    voltage = data_df_clean['Voltage'].values
+
+    # 2. 低通滤波（保留7Hz内的趋势）
+    nyq = 0.5 * down_sr
+    low = low_cutoff / nyq
+    b, a = butter(4, low, btype='low')
+    lowpass_voltage = filtfilt(b, a, voltage)
+
+    # 3. 中值滤波去小毛刺
+    denoised_voltage = medfilt(lowpass_voltage, kernel_size=denoise_win)
+
+    # 4. 高斯滤波（核心：让曲线更柔和、峰值更圆润）
+    # sigma越大，曲线越平滑（50是适配2w条数据的柔和值）
+    smooth_voltage = gaussian_filter1d(denoised_voltage, sigma=gauss_sigma)
+
+    # 5. 轻量尖峰增强（避免过度尖锐）
+    peak_mask = np.abs(smooth_voltage) > np.max(np.abs(smooth_voltage)) * 0.8
+    smooth_voltage = np.where(peak_mask, smooth_voltage * peak_gain, smooth_voltage)
+
+    # 6. 幅值校准
+    original_max_amp = np.max(np.abs(data_df['Voltage'].values))
+    enhanced_max_amp = np.max(np.abs(smooth_voltage))
+    if enhanced_max_amp > 0:
+        smooth_voltage = smooth_voltage * (original_max_amp / enhanced_max_amp)
+
+    return pd.DataFrame({'Voltage': smooth_voltage})
+
+
+def adaptive_piezo_preprocessing(data_df, down_sr):
+    """
+    自适应压电信号预处理（自动适配定/变流速数据）
+    :param data_df: 输入DataFrame
+    :param down_sr: 降采样率
+    :return: 处理后的DataFrame
+    """
+    voltage = data_df['Voltage'].values
+
+    # ========== 步骤1：分析数据特征（自动适配的核心） ==========
+    # 1.1 计算全局功率谱，确定“有效频率上限”
+    f, Pxx = welch(voltage, fs=down_sr, nperseg=min(len(voltage) // 10, 1000))
+    # 有效频率：功率前80%的频率范围
+    cum_power = np.cumsum(Pxx) / np.sum(Pxx)
+    valid_freq_cutoff = f[np.where(cum_power >= 0.8)[0][0]]  # 覆盖80%功率的频率
+    valid_freq_cutoff = max(valid_freq_cutoff, 5)  # 兜底不低于5Hz
+
+    # 1.2 计算噪声强度，确定平滑程度
+    noise_std = np.std(voltage[np.abs(voltage) < np.mean(np.abs(voltage))])
+    smooth_sigma = int(50 * (noise_std / np.max(np.abs(voltage))))  # 噪声越大，平滑越强
+    smooth_sigma = max(smooth_sigma, 20)  # 兜底不低于20
+
+    # ========== 步骤2：基础预处理（去直流+异常值） ==========
+    data_df_clean = remove_dc_offset_and_outliers(data_df)
+    voltage_clean = data_df_clean['Voltage'].values
+
+    # ========== 步骤3：自适应低通滤波（匹配有效频率） ==========
+    nyq = 0.5 * down_sr
+    low = valid_freq_cutoff / nyq
+    b, a = butter(4, low, btype='low')
+    lowpass_voltage = filtfilt(b, a, voltage_clean)
+
+    # ========== 步骤4：自适应平滑（匹配噪声强度） ==========
+    smooth_voltage = gaussian_filter1d(lowpass_voltage, sigma=smooth_sigma)
+
+    # ========== 步骤5：轻量尖峰增强 ==========
+    peak_mask = np.abs(smooth_voltage) > np.max(np.abs(smooth_voltage)) * 0.8
+    smooth_voltage = np.where(peak_mask, smooth_voltage * 1.2, smooth_voltage)
+
+    # ========== 步骤6：幅值校准 ==========
+    original_max_amp = np.max(np.abs(voltage))
+    enhanced_max_amp = np.max(np.abs(smooth_voltage))
+    if enhanced_max_amp > 0:
+        smooth_voltage = smooth_voltage * (original_max_amp / enhanced_max_amp)
+
+    print(f"自适应参数：有效频率截止={valid_freq_cutoff:.1f}Hz，平滑sigma={smooth_sigma}")
+    return pd.DataFrame({'Voltage': smooth_voltage})
+
+
+# 适用于变流速环境下主频率不能按照平均来的，因此我们用滑动窗口每一段计算频率，每个窗口大小1000，20个滑窗.表现差异太大不太好
+def enhance_lstm_feature_dynamic_freq(data_df, down_sr, window_size=1000, freq_band=1, target_freq_res=1):
+    """
+    动态基频跟踪的LSTM特征强化函数（适配变流速，修复10Hz锁定问题）
+    :param data_df: 输入DataFrame（含Voltage列）
+    :param down_sr: 降采样后的采样率（你的是1000Hz）
+    :param window_size: 滑窗大小（1000条/窗，对应1秒）
+    :param freq_band: 基频上下浮动范围（默认±1Hz）
+    :param target_freq_res: 目标频率分辨率（1Hz，能识别0-10Hz所有整数频率）
+    :return: 动态滤波后的DataFrame
+    """
+    voltage = data_df['Voltage'].values
+    original_max_amp = np.max(np.abs(voltage))  # 全局幅值校准用
+    n_points = len(voltage)
+    enhanced_voltage = np.zeros_like(voltage)  # 初始化输出数组
+
+    # 1. 划分滑窗（最后一个窗不足window_size则合并到前一个）
+    window_starts = np.arange(0, n_points, window_size)
+    if window_starts[-1] + window_size > n_points:
+        window_starts = window_starts[:-1]
+
+    # 2. 逐窗处理：动态计算基频 + 带通滤波
+    for i, start in enumerate(window_starts):
+        # 确定当前窗的结束位置
+        end = min(start + window_size, n_points)
+        window_voltage = voltage[start:end]
+        window_len = len(window_voltage)  # 当前窗的实际长度（1000条）
+
+        # ========== 步骤1：修复核心——按滑窗时长计算nperseg ==========
+        # 目标：频率分辨率=target_freq_res（1Hz）→ nperseg=采样率/分辨率
+        ideal_nperseg = int(down_sr / target_freq_res)  # 1000/1=1000
+        # 限制nperseg不超过窗长度的80%（避免分段数为0）
+        max_nperseg = int(window_len * 0.8)  # 1000*0.8=800
+        # 最终nperseg取“理想值”和“最大值”的较小值，且为偶数（滤波稳定）
+        nperseg = min(ideal_nperseg, max_nperseg)
+        nperseg = nperseg if nperseg % 2 == 0 else nperseg - 1  # 偶数化
+        # 分段数至少为2（避免Welch报错）
+        nperseg = max(nperseg, 2)
+
+        # ========== 步骤2：当前窗计算局部基频（修复频率轴） ==========
+        f, Pxx = welch(
+            window_voltage,
+            fs=down_sr,
+            nperseg=nperseg,
+            noverlap=nperseg // 2,  # 重叠50%，提升频谱精度
+            scaling='density'
+        )
+        # 过滤0-10Hz频率（保留真实基频范围）
+        freq_mask = (f >= 0) & (f <= 10)
+        f_filtered = f[freq_mask]
+        Pxx_filtered = Pxx[freq_mask]
+
+        # 兜底逻辑（无有效频率时用默认值）
+        if len(Pxx_filtered) == 0:
+            local_base_freq = 2  # 压电俘能常见基频
+            print(f"窗{i + 1}（{start}-{end}）：无有效频率，用默认值={local_base_freq:.2f}Hz")
+        else:
+            # 修复峰值阈值：提高到最大值的20%，过滤低功率伪峰值
+            peak_threshold = np.max(Pxx_filtered) * 0.2
+            peaks, properties = find_peaks(Pxx_filtered, height=peak_threshold)
+
+            if len(peaks) == 0:
+                # 无峰值时，选功率最大的频率（但排除0Hz直流分量）
+                non_dc_mask = f_filtered > 0  # 去掉0Hz
+                if np.sum(non_dc_mask) == 0:
+                    local_base_freq = 2
+                else:
+                    dominant_idx = np.argmax(Pxx_filtered[non_dc_mask])
+                    local_base_freq = f_filtered[non_dc_mask][dominant_idx]
+            else:
+                # 有峰值时，选功率最大的峰值
+                peak_energies = properties['peak_heights']
+                top_peak_idx = np.argsort(peak_energies)[::-1][0]
+                local_base_freq = f_filtered[peaks[top_peak_idx]]
+
+        # 打印真实的局部基频（验证修复效果）
+        print(f"窗{i + 1}（{start}-{end}）：局部基频={local_base_freq:.2f}Hz")
+
+        # ========== 步骤3：当前窗动态带通滤波（和原有逻辑一致） ==========
+        nyq = 0.5 * down_sr
+        low = (local_base_freq - freq_band) / nyq
+        high = (local_base_freq + freq_band) / nyq
+        # 边界保护：避免频率小于0或大于Nyquist频率
+        low = max(low, 0)
+        high = min(high, 1)
+
+        b, a = butter(2, [low, high], btype='band')
+        window_filtered = filtfilt(b, a, window_voltage)
+
+        # ========== 步骤4：当前窗尖峰增强 ==========
+        window_peak_mask = np.abs(window_filtered) > np.max(np.abs(window_filtered)) * 0.8
+        window_enhanced = np.where(window_peak_mask, window_filtered * 1.5, window_filtered)
+
+        # ========== 步骤5：当前窗幅值校准 ==========
+        window_max_amp = np.max(np.abs(window_enhanced))
+        if window_max_amp > 0:
+            window_enhanced = window_enhanced * (np.max(np.abs(window_voltage)) / window_max_amp)
+
+        # 赋值到输出数组
+        enhanced_voltage[start:end] = window_enhanced
+
+    # 全局幅值校准
+    enhanced_voltage = enhanced_voltage * (original_max_amp / np.max(np.abs(enhanced_voltage)))
+
+    return pd.DataFrame({'Voltage': enhanced_voltage})
